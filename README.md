@@ -1,6 +1,6 @@
 # authlume
 
-Authlume provides independently importable packages for Go 1.25 and later. The password and server-side session packages use the standard library. The [OpenID Connect login example](examples/oidc) uses the optional `oidc` package, which depends on go-oidc and oauth2. The [WebAuthn example](examples/webauthn) uses the optional `webauthn` package, which depends on go-webauthn.
+Authlume provides independently importable packages for Go 1.25 and later. The password and server-side session packages use the standard library. The [OpenID Connect login example](examples/oidc) uses the optional `oidc` package, which depends on go-oidc and oauth2. The [WebAuthn example](examples/webauthn) uses the optional `webauthn` package, which depends on go-webauthn. The [MCP OAuth example](examples/mcp) uses the `mcpoauth` package, which depends on the standard library only.
 
 ## From a password to a session
 
@@ -51,6 +51,36 @@ Set `session.Config{CookieName: "__Host-inventory"}` to give an app its own cook
 When login or logout rejects an old-format or ambiguous session cookie, offer an explicit recovery form. Its CSRF-protected POST handler calls `sessions.ResetInvalidCookie(w, r)`, then redirects to sign-in on success. This clears the app’s host-only cookie at `Path=/`. The user signs in again under the current authentication policy. Server records survive a browser reset until expiry or explicit revocation.
 
 If the method returns `session.ErrCookieWellFormed`, use the normal logout flow. If a legacy browser cookie with a different path or domain persists, remove that specific cookie in browser settings. The [sample handler](examples/web/main.go) includes the recovery form and route.
+
+## MCP OAuth
+
+The `mcpoauth` package is an OAuth 2.1 authorization server and bearer token verifier for one MCP server. It is independent of web login: the application keeps its own sign-in, consent screen and client registration, and resolves clients through a `mcpoauth.ClientLookup`. Registering a client grants nothing. Access starts with a user's consent, which creates one connection.
+
+```go
+oauth, err := mcpoauth.New(mcpoauth.Config{
+    Issuer:                "https://auth.example.com",
+    Resource:              "https://mcp.example.com/mcp",
+    AuthorizationEndpoint: "https://auth.example.com/authorize",
+    TokenEndpoint:         "https://auth.example.com/token",
+    RevocationEndpoint:    "https://auth.example.com/revoke",
+    Scopes:                []string{"mcp:read", "mcp:write"},
+    DefaultScopes:         []string{"mcp:read"},
+}, lookup, mcpoauth.NewMemoryStore())
+```
+
+The authorization endpoint passes its raw query string to `oauth.Authorize` and shows the consent screen. After authenticating the user and receiving a CSRF-protected consent POST, it passes the same query string and the user's subject to `oauth.Approve`, or calls `oauth.Deny`, and sends the browser to the returned URL. Authorization requires PKCE with S256 and an exactly matching redirect URI; a loopback redirect URI matches on any port. Mount `oauth.Token`, `oauth.Revocation`, `oauth.Metadata` at `oauth.MetadataPath()` and `oauth.ResourceMetadata` at `oauth.ResourceMetadataPath()`. Some clients look for the resource metadata at the root `/.well-known/oauth-protected-resource`, so a resource with a path can mount the same handler there too. The package sets no CORS headers.
+
+| Setting | Default |
+| --- | --- |
+| Access token lifetime (`AccessTTL`) | 1 hour |
+| Refresh lifetime since the last refresh (`RefreshIdle`) | 90 days |
+| Connection lifetime since consent (`ConnectionAbsolute`) | unlimited |
+
+A refresh replaces the access and refresh tokens in one atomic step. Presenting a rotated refresh token again revokes that connection only, without a grace period. `oauth.Disconnect` and the revocation endpoint revoke both tokens of a connection together. These checks, the issuer and resource binding and the 60-second single-use authorization code are not configurable.
+
+Protect the MCP endpoint with `oauth.Protect(handler, "mcp:read")` and read the verified token with `mcpoauth.FromContext`. Use `oauth.Verify`, `oauth.Challenge` and `oauth.InsufficientScope` directly where the endpoint also accepts another credential. Allow an operation only when both `Access.Scopes` and the user's current permissions cover it, reload the user's current state from `Access.Subject`, and never widen the scope of an existing connection.
+
+The in-memory store is for one process. For shared deployments implement `mcpoauth.Store` and check it with `storetest.Run`. The [MCP OAuth example](examples/mcp) runs the whole flow and lists the store contract, the application's duties and the differences from the specifications.
 
 ## Run the HTTPS sample
 

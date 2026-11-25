@@ -21,6 +21,10 @@ if err != nil {
 
 In the login handler, call `auth.Authenticate(r.Context(), identifier, secret)`, handle its error, then inspect the result. Call `sessions.Issue(w, r, result.Subject)` only when the login policy is complete. To require MFA, pass a policy function to `password.New` that returns `password.RequireMFA` for the relevant subject. At that point the app must complete its additional verification before issuing a session. The [sample handler](examples/web) shows both branches.
 
+## Optional second factors
+
+After the primary method identifies a local subject, the application can verify an enrolled [TOTP code](examples/totp) or a [WebAuthn credential](examples/webauthn). The WebAuthn example covers authorized first enrollment, browser-bound verification, and issuing the regular session after both factors succeed. The application owns enrollment authorization, MFA requirements and account recovery.
+
 ## Session policy
 
 | Setting | OSS default | Example i2 application profile |

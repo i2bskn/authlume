@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Authlume WebAuthn demo</title>
+<h1>Sign in with a passkey or security key</h1>
+<form id="auth" method="post">
+<p><label>Username <input name="username" autocomplete="username" required></label></p>
+<p><label>Password <input name="password" type="password" autocomplete="current-password" required></label></p>
+<p><label>Enrollment code (first registration only) <input name="code" type="password" autocomplete="off"></label></p>
+<button value="login">Sign in</button> <button value="register">Register first key</button>
+</form>
+<p role="status" id="status"></p>
+<script>
+const form = document.querySelector("#auth");
+const status = document.querySelector("#status");
+form.addEventListener("submit", async event => {
+  event.preventDefault();
+  const action = event.submitter.value;
+  const registering = action === "register";
+  const fields = new URLSearchParams(new FormData(form));
+  if (!registering) fields.delete("code");
+  try {
+    const begin = await fetch("/" + action + "/begin", {method: "POST", body: fields});
+    if (!begin.ok) throw new Error(await begin.text());
+    const {publicKey} = await begin.json();
+    const credential = registering
+      ? await navigator.credentials.create({publicKey: PublicKeyCredential.parseCreationOptionsFromJSON(publicKey)})
+      : await navigator.credentials.get({publicKey: PublicKeyCredential.parseRequestOptionsFromJSON(publicKey)});
+    const finish = await fetch("/" + action + "/finish", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(credential.toJSON())});
+    if (!finish.ok) throw new Error(await finish.text());
+    form.reset();
+    if (registering) status.textContent = "Key registered. Sign in with your password and key.";
+    else location.assign("/protected");
+  } catch (error) { status.textContent = error.message; }
+});
+</script>
+</html>

@@ -1,11 +1,12 @@
 // Package totp verifies enrolled RFC 6238 second factors for an application's
 // already authenticated subject. The profile uses six digits, HMAC-SHA-1,
-// a 30-second period and Unix epoch T0. Verification checks the server's
-// current period and the preceding period to allow for entry delay. If a fast
-// device already shows the next period, that step is eligible only when the
-// server reaches it. This profile requires HMAC-SHA-1 and is incompatible
-// with Go's FIPS 140-only mode. Applications own enrollment, recovery,
-// throttling and the decision to require this factor.
+// a 30-second period and Unix epoch T0. By default, verification checks the
+// server's current period and the preceding period to allow for entry delay.
+// WithCurrentStepOnly limits it to the current period. If a fast device
+// already shows the next period, that step is eligible only when the server
+// reaches it. This profile requires HMAC-SHA-1 and is incompatible with Go's
+// FIPS 140-only mode. Applications own enrollment, recovery, throttling and
+// the decision to require this factor.
 package totp
 
 import (
@@ -24,7 +25,23 @@ var (
 	ErrInvalid = errors.New("totp: invalid credentials")
 	// ErrRecord indicates an invalid enrollment supplied by the store.
 	ErrRecord = errors.New("totp: invalid enrollment")
+	errOption = errors.New("totp: invalid option")
 )
+
+type config struct {
+	currentOnly bool
+}
+
+// Option configures a Verifier.
+type Option func(*config)
+
+// WithCurrentStepOnly makes Verify accept only the server's current period.
+// A code is then valid for at most 30 seconds, and a code entered near the
+// end of its period fails once the next period begins. A device whose clock
+// is slow enough to still show the preceding period always fails.
+func WithCurrentStepOnly() Option {
+	return func(c *config) { c.currentOnly = true }
+}
 
 // Credential is a consistent snapshot of an active enrollment. Each activation
 // needs a fresh random secret of at least 20 bytes and a never-reused ID.
@@ -50,19 +67,31 @@ type Store interface {
 
 // Verifier checks and consumes codes for the configured application.
 type Verifier struct {
-	store Store
-	now   func() time.Time
+	store       Store
+	now         func() time.Time
+	currentOnly bool
 }
 
 // New creates a verifier. An optional concurrency-safe clock replaces time.Now.
-func New(store Store, now func() time.Time) (*Verifier, error) {
+// Options are optional. Without options Verify accepts the current and the
+// preceding period. A nil option is an error.
+func New(store Store, now func() time.Time, opts ...Option) (*Verifier, error) {
 	if store == nil {
 		return nil, errors.New("totp: store is required")
+	}
+	for _, opt := range opts {
+		if opt == nil {
+			return nil, errOption
+		}
 	}
 	if now == nil {
 		now = time.Now
 	}
-	return &Verifier{store: store, now: now}, nil
+	var cfg config
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return &Verifier{store: store, now: now, currentOnly: cfg.currentOnly}, nil
 }
 
 // Verify completes the TOTP check for subject, as established by successful
@@ -97,8 +126,12 @@ func (v *Verifier) Verify(ctx context.Context, subject, code string) error {
 		return ErrInvalid
 	}
 	current := seconds / 30
+	first := current - 1
+	if v.currentOnly {
+		first = current
+	}
 	matched := int64(-1)
-	for step := current - 1; step <= current; step++ {
+	for step := first; step <= current; step++ {
 		if step >= 0 && subtle.ConstantTimeCompare([]byte(code), digits(cred.Secret, step)) == 1 {
 			matched = step
 		}

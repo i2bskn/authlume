@@ -82,8 +82,28 @@ func TestConfigAndDefaults(t *testing.T) {
 	if err != nil || len(raw) != 32 || state.Key != Key(sha256.Sum256(raw)) {
 		t.Fatal("invalid ID or digest")
 	}
-	if state.Subject != "user" || state.Idle != 24*time.Hour || state.AbsoluteExpiry.Sub(state.AuthenticatedAt) != 7*24*time.Hour || !c.Expires.Equal(state.AbsoluteExpiry.Truncate(time.Second)) {
+	if state.Subject != "user" || state.Idle != 24*time.Hour || state.AbsoluteExpiry.Sub(state.AuthenticatedAt) != 7*24*time.Hour || c.Expires.Before(state.AbsoluteExpiry) || c.Expires.Sub(state.AbsoluteExpiry) >= time.Second {
 		t.Fatal("wrong default lifetimes or subject")
+	}
+}
+
+func TestCookieExpiryRoundsUpWhileServerKeepsPreciseDeadline(t *testing.T) {
+	base := time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)
+	for _, ttl := range []time.Duration{100 * time.Millisecond, time.Second} {
+		now := base
+		m := manager(t, NewMemoryStore(), Config{Idle: ttl, Absolute: ttl, Now: func() time.Time { return now }})
+		c := issue(t, m, request())
+		if !c.Expires.Equal(base.Add(time.Second)) {
+			t.Fatalf("ttl %v: browser expiry %s", ttl, c.Expires)
+		}
+		now = base.Add(ttl - time.Nanosecond)
+		if _, err := m.Read(request(c)); err != nil {
+			t.Fatalf("ttl %v: session expired early: %v", ttl, err)
+		}
+		now = base.Add(ttl)
+		if _, err := m.Read(request(c)); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("ttl %v: server deadline not enforced: %v", ttl, err)
+		}
 	}
 }
 

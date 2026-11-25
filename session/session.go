@@ -121,6 +121,11 @@ func cookieKey(r *http.Request) (*Key, error) {
 }
 
 func cookie(value string, expires time.Time) *http.Cookie {
+	// HTTP dates only carry whole seconds. Round up so the browser retains
+	// the cookie until the server's precise deadline, including subsecond TTLs.
+	if ns := expires.Nanosecond(); ns != 0 {
+		expires = expires.Add(time.Second - time.Duration(ns))
+	}
 	return &http.Cookie{
 		Name: CookieName, Value: value, Expires: expires.UTC(), Path: "/",
 		Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,

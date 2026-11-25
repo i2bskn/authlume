@@ -25,10 +25,7 @@ func (s *demoStore) Load(ctx context.Context, subject string) ([]webauthn.Record
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if subject != demoSubject {
-		return nil, webauthn.ErrInvalid
-	}
-	if s.version == "" {
+	if subject != demoSubject || s.version == "" {
 		return nil, nil
 	}
 	var key webauthn.Credential
@@ -36,6 +33,12 @@ func (s *demoStore) Load(ctx context.Context, subject string) ([]webauthn.Record
 		return nil, err
 	}
 	return []webauthn.Record{{Credential: key, Version: s.version}}, nil
+}
+
+func (s *demoStore) enrolled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.version != ""
 }
 
 func (s *demoStore) Insert(ctx context.Context, subject string, key webauthn.Credential) error {

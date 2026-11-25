@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/subtle"
 	_ "embed"
 	"encoding/base64"
@@ -44,19 +43,13 @@ func main() {
 	log.Fatal(srv.ListenAndServeTLS(*cert, *key))
 }
 
-type transaction struct {
-	subject  string
-	ceremony *webauthn.Ceremony
-	expires  time.Time
-}
-
 type app struct {
 	auth     *password.Authenticator
 	keys     *webauthn.Verifier
 	sessions *session.Manager
+	store    *demoStore
 	code     string
 	mu       sync.Mutex
-	pending  map[string]transaction
 	reset    time.Time
 	attempts int
 }
@@ -78,7 +71,7 @@ func demo(secret, code string, store *demoStore) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	keys, err := webauthn.New(origin, "Authlume demo", store)
+	keys, err := webauthn.New(origin, "Authlume demo", store, webauthn.NewMemoryCeremonyStore())
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +79,7 @@ func demo(secret, code string, store *demoStore) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &app{auth: auth, keys: keys, sessions: sessions, code: code, pending: make(map[string]transaction)}
+	a := &app{auth: auth, keys: keys, sessions: sessions, store: store, code: code}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -116,14 +109,11 @@ func demo(secret, code string, store *demoStore) (http.Handler, error) {
 
 func deny(w http.ResponseWriter) { http.Error(w, "Authentication failed.", http.StatusUnauthorized) }
 
+// allow is a demo limit. Everyone shares one budget, consumed before the
+// password check. In production, limit per account and per client.
 func (a *app) allow(now time.Time) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for id, tx := range a.pending {
-		if !now.Before(tx.expires) {
-			delete(a.pending, id)
-		}
-	}
 	if !now.Before(a.reset) {
 		a.reset = now.Add(time.Minute)
 		a.attempts = 0
@@ -150,41 +140,29 @@ func (a *app) begin(w http.ResponseWriter, r *http.Request, action string) {
 		deny(w)
 		return
 	}
-	var options any
-	var ceremony *webauthn.Ceremony
+	var options json.RawMessage
+	var handle string
 	if action == "register" {
-		if subtle.ConstantTimeCompare([]byte(a.code), []byte(r.PostForm.Get("code"))) != 1 {
+		if subtle.ConstantTimeCompare([]byte(a.code), []byte(r.PostForm.Get("code"))) != 1 || a.store.enrolled() {
 			deny(w)
 			return
 		}
-		creation, pending, beginErr := a.keys.BeginRegistration(r.Context(), user.Subject, "demo")
-		if beginErr != nil || len(creation.Response.CredentialExcludeList) != 0 {
-			deny(w)
-			return
-		}
-		options, ceremony = creation, pending
+		options, handle, err = a.keys.BeginRegistration(r.Context(), user.Subject, "demo")
 	} else {
-		options, ceremony, err = a.keys.BeginVerification(r.Context(), user.Subject)
+		options, handle, err = a.keys.BeginVerification(r.Context(), user.Subject)
 	}
 	if err != nil {
 		deny(w)
 		return
 	}
-	id := rand.Text()
-	a.mu.Lock()
-	// A new begin supersedes the previous transaction in this browser.
-	for _, old := range r.CookiesNamed(flowCookie) {
-		delete(a.pending, old.Value)
-	}
-	a.pending[id] = transaction{user.Subject, ceremony, time.Now().Add(5 * time.Minute)}
-	a.mu.Unlock()
-	setFlowCookie(w, id, 300)
+	// The new cookie replaces any earlier handle. Its ceremony expires unused.
+	setFlowCookie(w, handle, 300)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(options)
+	w.Write(options)
 }
 
-func setFlowCookie(w http.ResponseWriter, id string, age int) {
-	http.SetCookie(w, &http.Cookie{Name: flowCookie, Value: id, Path: "/", Secure: true,
+func setFlowCookie(w http.ResponseWriter, handle string, age int) {
+	http.SetCookie(w, &http.Cookie{Name: flowCookie, Value: handle, Path: "/", Secure: true,
 		HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: age})
 }
 
@@ -194,31 +172,25 @@ func (a *app) finish(w http.ResponseWriter, r *http.Request, action string) {
 		deny(w)
 		return
 	}
-	a.mu.Lock()
-	tx, ok := a.pending[cookies[0].Value]
-	delete(a.pending, cookies[0].Value)
-	a.mu.Unlock()
+	// Finish consumes the ceremony even when it fails, so the handle is spent.
 	setFlowCookie(w, "", -1)
-	if !ok || !time.Now().Before(tx.expires) {
-		deny(w)
-		return
-	}
 	response, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 128<<10))
 	if err != nil {
 		deny(w)
 		return
 	}
 	if action == "register" {
-		if err := a.keys.FinishRegistration(r.Context(), tx.subject, tx.ceremony, response); err != nil {
+		if _, err := a.keys.FinishRegistration(r.Context(), cookies[0].Value, response); err != nil {
 			deny(w)
 			return
 		}
 	} else {
-		if err := a.keys.FinishVerification(r.Context(), tx.subject, tx.ceremony, response); err != nil {
+		subject, err := a.keys.FinishVerification(r.Context(), cookies[0].Value, response)
+		if err != nil {
 			deny(w)
 			return
 		}
-		if err := a.sessions.Issue(w, r, tx.subject); err != nil {
+		if err := a.sessions.Issue(w, r, subject); err != nil {
 			http.Error(w, "Session unavailable.", http.StatusServiceUnavailable)
 			return
 		}

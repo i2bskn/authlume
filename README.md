@@ -1,6 +1,6 @@
 # authlume
 
-Authlume provides independently importable packages for Go 1.25 and later. The password and server-side session packages use the standard library. The [OpenID Connect login example](examples/oidc) uses the optional `oidc` package, which depends on go-oidc and oauth2.
+Authlume provides independently importable packages for Go 1.25 and later. The password and server-side session packages use the standard library. The [OpenID Connect login example](examples/oidc) uses the optional `oidc` package, which depends on go-oidc and oauth2. The [WebAuthn example](examples/webauthn) uses the optional `webauthn` package, which depends on go-webauthn.
 
 ## From a password to a session
 

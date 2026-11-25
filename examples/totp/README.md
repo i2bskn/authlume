@@ -37,4 +37,4 @@ Import `github.com/i2bskn/authlume/totp` and implement its `Store` for your own 
 
 After primary authentication, apply the application's MFA policy. If TOTP is required, pass the verified subject and submitted code to `verifier.Verify(ctx, subject, code)`. Only a successful verification permits that policy path to call `sessions.Issue`. If session issuance fails, start a fresh login with a newer code. For a flow spanning multiple requests, retain the verified subject and purpose in an expiring, browser-bound, single-use server-side login transaction. For OIDC, accepting upstream MFA assurance requires an explicit application policy over verified evidence. The presence of a claim alone leaves the additional factor pending.
 
-WebAuthn second factors use a separate public-key ceremony. Username-less passkey sign-in also needs a distinct application setting, discoverable credentials and required user verification. Both flows are reserved for follow-up changes.
+The [WebAuthn example](../webauthn) demonstrates a separate public-key ceremony for the same first-factor subject. Username-less passkey sign-in requires its own application policy and flow.

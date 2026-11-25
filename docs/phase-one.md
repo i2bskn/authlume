@@ -2,11 +2,13 @@
 
 Go 1.25+ module `github.com/i2bskn/authlume`. Two independent standard-library packages. Only the application composes them. An opaque nonempty subject string is the sole application identifier. The application owns identifier normalization, enrollment rules, authorization, account lifecycle, throttling and its database schema.
 
+The minimal setup is a credential lookup and a session store with zero configuration. Password checks, server validation, secure transport cookie attributes and revocation are invariants. Applications choose MFA, freshness windows and session lifetimes according to their audience; stronger product policies live at call sites.
+
 ## Password authentication
 
 * `password.Hash` generates a fresh 16-byte salt with crypto/rand. Records use a versioned PBKDF2-HMAC-SHA256 encoding with 600,000 iterations and a 32-byte result. The v1 verifier accepts exactly these parameters and canonical fixed-size base64 fields before performing any derivation, and compares the result in constant time. This choice uses Go's standard crypto/pbkdf2 and the OWASP work factor for SHA-256. A different cost or algorithm needs a new record version. Passwords are opaque bytes in Go strings, bounded at 1–1024 bytes and never truncated.
-* The application supplies a context-aware lookup (subject and encoded hash, distinguished missing-account error) and a mandatory post-password policy callback. Missing-account and wrong-password results both return ErrCredentials. A missing account performs equivalent dummy KDF work. Corrupt records, store errors and policy errors fail closed and remain distinguishable internally. Applications return generic errors and never log credentials.
-* Policy chooses PasswordOnly or RequireMFA for the verified subject. An empty or unrecognized decision fails closed. Authentication returns subject and decision only after verification and successful policy evaluation. A RequireMFA result represents an incomplete login. Phase one issues no challenge tokens. Only an explicit PasswordOnly branch in the sample calls the session issuer. Password has no cookie or session API.
+* The application supplies a context-aware lookup (subject and encoded hash, distinguished missing-account error) and can supply a post-password policy callback. Omitting that callback selects PasswordOnly. Missing-account and wrong-password results both return ErrCredentials. A missing account performs equivalent dummy KDF work. Corrupt records, store errors and policy errors fail closed and remain distinguishable internally. Applications return generic errors and never log credentials.
+* A configured policy chooses PasswordOnly or RequireMFA for the verified subject. An empty or unrecognized decision fails closed. Authentication returns subject and decision only after verification and successful policy evaluation. A RequireMFA result represents an incomplete login. Phase one issues no challenge tokens. Only an explicit PasswordOnly branch in the sample calls the session issuer. Password has no cookie or session API.
 
 ## Web sessions
 

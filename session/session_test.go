@@ -185,14 +185,14 @@ func TestRotationRevocationAndLogout(t *testing.T) {
 }
 
 func TestCookieValidation(t *testing.T) {
-	m := manager(t, NewMemoryStore(), Config{})
+	m := manager(t, NewMemoryStore(), Config{CookieName: "__Host-custom"})
 	c := issue(t, m, request())
-	valid := CookieName + "=" + c.Value
+	valid := c.Name + "=" + c.Value
 	for _, lines := range [][]string{
-		{valid + "; " + valid}, {valid, valid}, {CookieName + "="},
-		{CookieName + "=\"" + c.Value + "\""}, {valid + "="},
-		{valid, CookieName + "=bad"}, {CookieName + " =" + c.Value},
-		{CookieName + "=" + strings.Repeat("A", 42) + "B"}, // nonzero unused base64 bits
+		{valid + "; " + valid}, {valid, valid}, {c.Name + "="},
+		{c.Name + "=\"" + c.Value + "\""}, {valid + "="},
+		{valid, c.Name + "=bad"}, {c.Name + " =" + c.Value},
+		{c.Name + "=" + strings.Repeat("A", 42) + "B"}, // nonzero unused base64 bits
 	} {
 		r := request()
 		for _, line := range lines {
@@ -202,6 +202,7 @@ func TestCookieValidation(t *testing.T) {
 		for _, op := range []func() error{
 			func() error { _, err := m.Read(r); return err },
 			func() error { _, err := m.Touch(r); return err },
+			func() error { _, err := m.RequireFresh(r, time.Hour); return err },
 			func() error { return m.Issue(w, r, "user") },
 			func() error { return m.Logout(w, r) },
 		} {
@@ -234,5 +235,120 @@ func TestStorageErrors(t *testing.T) {
 	}
 	if _, err := m.Read(request(c)); err != nil {
 		t.Fatal("failed operations changed session")
+	}
+}
+
+func TestCookieNameConfiguration(t *testing.T) {
+	const prefix = "__Host-"
+	longest := prefix + strings.Repeat("x", 4096-43-len(prefix))
+	for _, name := range []string{"app", "__Secure-app", "__host-app", prefix, prefix + "a b", prefix + "a=b", prefix + "a;b", prefix + "ü", longest + "x"} {
+		if _, err := New(NewMemoryStore(), Config{CookieName: name}); err == nil {
+			t.Fatalf("accepted invalid cookie name (%d bytes): %.24q", len(name), name)
+		}
+	}
+	m := manager(t, NewMemoryStore(), Config{CookieName: longest})
+	c := issue(t, m, request())
+	if c.Name != longest || len(c.Name)+len(c.Value) != 4096 {
+		t.Fatal("failed to issue the longest supported cookie name")
+	}
+}
+
+func TestIndependentManagersOnSameHost(t *testing.T) {
+	first := manager(t, NewMemoryStore(), Config{CookieName: "__Host-App"})
+	second := manager(t, NewMemoryStore(), Config{CookieName: "__Host-app"})
+	a := issue(t, first, request())
+	b := issue(t, second, request(a))
+	if a.Name != "__Host-App" || b.Name != "__Host-app" {
+		t.Fatal("cookies did not preserve configured names")
+	}
+	for _, check := range []struct {
+		m          *Manager
+		own, other *http.Cookie
+	}{
+		{first, a, b}, {second, b, a},
+	} {
+		r := request(check.other, check.own)
+		own, err := check.m.Read(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, op := range []func(*http.Request) (State, error){
+			check.m.Touch, func(r *http.Request) (State, error) { return check.m.RequireFresh(r, time.Hour) },
+		} {
+			if state, err := op(r); err != nil || state.Key != own.Key {
+				t.Fatal("activity or reauthentication read the wrong cookie")
+			}
+		}
+		if _, err := check.m.Read(request(check.other)); !errors.Is(err, ErrInvalid) {
+			t.Fatal("read another app's cookie")
+		}
+	}
+	newA := issue(t, first, request(a, b))
+	if _, err := first.Read(request(a)); !errors.Is(err, ErrInvalid) {
+		t.Fatal("rotation retained previous session")
+	}
+	w := httptest.NewRecorder()
+	if err := first.Logout(w, request(b, newA)); err != nil {
+		t.Fatal(err)
+	}
+	checkExpiredCookie(t, w, a.Name)
+	if _, err := first.Read(request(newA)); !errors.Is(err, ErrInvalid) {
+		t.Fatal("custom-named session survived logout")
+	}
+	if _, err := second.Read(request(b)); err != nil {
+		t.Fatal("another app lost its session")
+	}
+}
+
+func checkExpiredCookie(t *testing.T, w *httptest.ResponseRecorder, name string) {
+	t.Helper()
+	cookies := w.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("got %d cookies, want one", len(cookies))
+	}
+	c := cookies[0]
+	if c.Name != name || !c.Secure || !c.HttpOnly || c.Path != "/" || c.SameSite != http.SameSiteLaxMode || c.Domain != "" || c.MaxAge >= 0 || c.Value != "" || !c.Expires.Before(time.Now()) {
+		t.Fatal("incorrect expired cookie attributes")
+	}
+}
+
+func TestResetInvalidCookie(t *testing.T) {
+	const name = "__Host-example"
+	m := manager(t, NewMemoryStore(), Config{CookieName: name})
+	live := issue(t, m, request())
+	// The nil embedded Store makes any backend call fail the test immediately.
+	recovery := manager(t, struct{ Store }{}, Config{CookieName: name})
+	malformed := &http.Cookie{Name: name, Value: "incomplete"}
+	other := &http.Cookie{Name: CookieName, Value: "unrelated"}
+	for _, tc := range []struct {
+		label   string
+		r       *http.Request
+		wantErr error
+		clear   bool
+	}{
+		{"malformed", request(other, malformed), nil, true},
+		{"ambiguous", request(live, other, live), nil, true},
+		{"missing", request(other), nil, false},
+		{"well formed", request(other, live), ErrCookieWellFormed, false},
+		{"unknown but well formed", request(&http.Cookie{Name: name, Value: strings.Repeat("A", 43)}), ErrCookieWellFormed, false},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			if err := recovery.ResetInvalidCookie(w, tc.r); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("reset: got %v, want %v", err, tc.wantErr)
+			}
+			if tc.clear {
+				checkExpiredCookie(t, w, name)
+			} else if len(w.Header()) != 0 {
+				t.Fatal("unnecessary cookie mutation")
+			}
+		})
+	}
+	// A real manager handling duplicate credentials only clears the browser scope.
+	if err := m.ResetInvalidCookie(httptest.NewRecorder(), request(live, live)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Read(request(live)); err != nil {
+		t.Fatal("reset changed stored session")
 	}
 }

@@ -22,6 +22,7 @@ func main() {
 	requireMFA := flag.Bool("require-mfa", false, "require another authentication factor for the demo account")
 	idle := flag.Duration("idle", session.DefaultIdle, "session idle timeout")
 	absolute := flag.Duration("absolute", session.DefaultAbsolute, "absolute session lifetime")
+	cookieName := flag.String("cookie-name", session.CookieName, "host-prefixed session cookie name")
 	flag.Parse()
 	if *cert == "" || *key == "" {
 		log.Fatal("supply -cert and -key for the local HTTPS server")
@@ -30,7 +31,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	sessions, err := session.New(session.NewMemoryStore(), session.Config{Idle: *idle, Absolute: *absolute})
+	sessions, err := session.New(session.NewMemoryStore(), session.Config{
+		Idle: *idle, Absolute: *absolute, CookieName: *cookieName,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -79,8 +82,19 @@ const protectedPage = `<!doctype html><html lang="en"><meta charset="utf-8"><tit
 <form method="post" action="/activity"><button>Record my activity</button></form>
 <form method="post" action="/logout"><button>Sign out</button></form></html>`
 
-func writePage(w http.ResponseWriter, page string) {
+const recoveryPage = `<!doctype html><html lang="en"><meta charset="utf-8"><title>Reset sign-in cookie</title>
+<h1>This app could not read its sign-in cookie</h1>
+<p>Reset the cookie in this browser, then sign in again.</p>
+<form method="post" action="/reset-cookie"><button>Reset this app’s sign-in cookie</button></form>
+<p>If this message returns after a reset, remove this app’s old sign-in cookie in your browser settings.</p></html>`
+
+const regularLogoutPage = `<!doctype html><html lang="en"><meta charset="utf-8"><title>Sign out</title>
+<h1>This sign-in cookie can be read</h1><p>Use sign out to end the session.</p>
+<form method="post" action="/logout"><button>Sign out</button></form></html>`
+
+func writePage(w http.ResponseWriter, status int, page string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
 	io.WriteString(w, page)
 }
 
@@ -92,10 +106,18 @@ func sessionError(w http.ResponseWriter, err error) {
 	http.Error(w, "Session service unavailable.", http.StatusServiceUnavailable)
 }
 
+func loginOrLogoutError(w http.ResponseWriter, err error) {
+	if errors.Is(err, session.ErrInvalid) {
+		writePage(w, http.StatusUnauthorized, recoveryPage)
+		return
+	}
+	sessionError(w, err)
+}
+
 func handler(auth *password.Authenticator, sessions *session.Manager) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-		writePage(w, loginPage)
+		writePage(w, http.StatusOK, loginPage)
 	})
 	mux.HandleFunc("POST /login", func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
@@ -115,7 +137,7 @@ func handler(auth *password.Authenticator, sessions *session.Manager) http.Handl
 		switch result.Decision {
 		case password.PasswordOnly:
 			if err := sessions.Issue(w, r, result.Subject); err != nil {
-				sessionError(w, err)
+				loginOrLogoutError(w, err)
 				return
 			}
 			http.Redirect(w, r, "/protected", http.StatusSeeOther)
@@ -130,7 +152,7 @@ func handler(auth *password.Authenticator, sessions *session.Manager) http.Handl
 			sessionError(w, err)
 			return
 		}
-		writePage(w, protectedPage)
+		writePage(w, http.StatusOK, protectedPage)
 	})
 	mux.HandleFunc("GET /poll", func(w http.ResponseWriter, r *http.Request) {
 		if _, err := sessions.Read(r); err != nil {
@@ -148,6 +170,18 @@ func handler(auth *password.Authenticator, sessions *session.Manager) http.Handl
 	})
 	mux.HandleFunc("POST /logout", func(w http.ResponseWriter, r *http.Request) {
 		if err := sessions.Logout(w, r); err != nil {
+			loginOrLogoutError(w, err)
+			return
+		}
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	})
+	mux.HandleFunc("POST /reset-cookie", func(w http.ResponseWriter, r *http.Request) {
+		err := sessions.ResetInvalidCookie(w, r)
+		if errors.Is(err, session.ErrCookieWellFormed) {
+			writePage(w, http.StatusConflict, regularLogoutPage)
+			return
+		}
+		if err != nil {
 			sessionError(w, err)
 			return
 		}

@@ -7,7 +7,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -169,10 +168,17 @@ func TestTokenExchangeRejected(t *testing.T) {
 			if reached := f.store.calls["TakeCode"] > before; reached != (tc.reach || unknown) {
 				t.Fatalf("store reached: %v", reached)
 			}
-			// A code is consumed by its first lookup, successful or not.
+			// A code is consumed by its first lookup, successful or not, and
+			// presenting it again is reuse. Only a successful first exchange
+			// left a connection to revoke.
 			again := post(t, f.Token, correct)
 			if tc.reach {
 				again.rejected(t, 400, "invalid_grant")
+				revoked := again.event.ConnectionID != ""
+				if again.err != ErrReused || revoked != (tc.want == "") || (again.event.Subject != "") != revoked ||
+					(revoked && again.event.ConnectionID != r.event.ConnectionID) || len(f.connections("user")) != 1 {
+					t.Fatalf("second exchange: err %v, event %+v", again.err, again.event)
+				}
 			} else {
 				granted(t, again)
 			}
@@ -189,16 +195,23 @@ func TestTokenCodeLifetime(t *testing.T) {
 	f.advance(60*time.Second - time.Nanosecond)
 	granted(t, post(t, f.Token, exchangeForm(early)))
 	f.advance(time.Nanosecond)
-	post(t, f.Token, exchangeForm(late)).rejected(t, 400, "invalid_grant")
-	// The expired code is consumed and never works on an earlier clock.
-	f.advance(-time.Minute)
-	post(t, f.Token, exchangeForm(late)).rejected(t, 400, "invalid_grant")
+	// The expired code is deleted and never works on an earlier clock.
+	for range 2 {
+		r := post(t, f.Token, exchangeForm(late))
+		r.rejected(t, 400, "invalid_grant")
+		if errors.Is(r.err, ErrReused) {
+			t.Fatalf("expired code: %v", r.err)
+		}
+		f.advance(-time.Minute)
+	}
 }
 
 func TestTokenConcurrentExchange(t *testing.T) {
 	f := newFixture(t)
+	sibling := f.connect("user")
 	code := f.code(authParams(), "user")
-	var issued atomic.Int32
+	var mu sync.Mutex
+	var winners []string
 	var wg sync.WaitGroup
 	begin := make(chan struct{})
 	for range 16 {
@@ -206,17 +219,215 @@ func TestTokenConcurrentExchange(t *testing.T) {
 			<-begin
 			r := post(t, f.Token, exchangeForm(code))
 			if r.status == http.StatusOK {
-				issued.Add(1)
-			} else if r.status != http.StatusBadRequest || r.body != `{"error":"invalid_grant"}` {
-				t.Errorf("status %d body %q", r.status, r.body)
+				mu.Lock()
+				defer mu.Unlock()
+				winners = append(winners, r.field("access_token"))
+			} else if r.status != http.StatusBadRequest || r.body != `{"error":"invalid_grant"}` || r.err != ErrReused {
+				t.Errorf("status %d body %q err %v", r.status, r.body, r.err)
 			}
 		})
 	}
 	close(begin)
 	wg.Wait()
-	if issued.Load() != 1 || len(f.connections("user")) != 1 {
-		t.Fatalf("%d exchanges succeeded, %d connections", issued.Load(), len(f.connections("user")))
+	// Every losing request presented a consumed code. That revokes the
+	// winner's connection, or refuses it before it is created.
+	if len(winners) > 1 || len(f.connections("user")) != 1 {
+		t.Fatalf("%d exchanges succeeded, %d connections", len(winners), len(f.connections("user")))
 	}
+	for _, access := range winners {
+		if f.valid(access) {
+			t.Fatal("an access token survived concurrent exchanges")
+		}
+	}
+	if !f.valid(sibling.access) {
+		t.Fatal("concurrent exchanges revoked another connection")
+	}
+}
+
+func TestCodeReuse(t *testing.T) {
+	confidential := func(v url.Values) { v.Set("client_id", "confidential"); v.Set("client_secret", testSecret) }
+	for _, tc := range []struct {
+		name   string
+		change func(url.Values)
+		client string
+	}{
+		{"same client", func(url.Values) {}, "public"},
+		{"another client", confidential, "confidential"},
+		{"another verifier", func(v url.Values) { v.Set("code_verifier", strings.Repeat("v", 43)) }, "public"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			sibling, stranger := f.connect("user"), f.connect("other")
+			code := f.code(authParams(), "user")
+			g := granted(t, post(t, f.Token, exchangeForm(code)))
+			if conn, err := f.stored(g.refresh); err != nil || conn.Code != f.key("code", code) {
+				t.Fatalf("connection %+v, %v", conn, err)
+			}
+			f.advance(codeTTL - time.Nanosecond)
+
+			form := exchangeForm(code)
+			tc.change(form)
+			r := post(t, f.Token, form)
+			r.rejected(t, 400, "invalid_grant")
+			if r.err != ErrReused || r.event != (Event{Grant: "authorization_code", ClientID: tc.client, ConnectionID: g.id, Subject: "user"}) {
+				t.Fatalf("err %v, event %+v", r.err, r.event)
+			}
+			if f.valid(g.access) {
+				t.Fatal("the access token survived reuse detection")
+			}
+			if _, err := f.stored(g.refresh); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("the connection survived reuse detection: %v", err)
+			}
+			refreshed := f.refresh(g.refresh)
+			refreshed.rejected(t, 400, "invalid_grant")
+			if errors.Is(refreshed.err, ErrReused) || refreshed.event.ConnectionID != "" {
+				t.Fatalf("refresh after code reuse: err %v, event %+v", refreshed.err, refreshed.event)
+			}
+			// Later attempts are still reuse, with no connection left.
+			r = post(t, f.Token, exchangeForm(code))
+			r.rejected(t, 400, "invalid_grant")
+			if r.err != ErrReused || r.event != (Event{Grant: "authorization_code", ClientID: "public"}) {
+				t.Fatalf("err %v, event %+v", r.err, r.event)
+			}
+			if !f.valid(sibling.access) || !f.valid(stranger.access) || len(f.connections("user")) != 1 || len(f.connections("other")) != 1 {
+				t.Fatal("code reuse revoked another connection")
+			}
+			granted(t, f.refresh(sibling.refresh))
+		})
+	}
+
+	// A rotation keeps the link to the code.
+	t.Run("after a refresh", func(t *testing.T) {
+		f := newFixture(t)
+		code := f.code(authParams(), "user")
+		g := granted(t, post(t, f.Token, exchangeForm(code)))
+		rotated := granted(t, f.refresh(g.refresh))
+		r := post(t, f.Token, exchangeForm(code))
+		r.rejected(t, 400, "invalid_grant")
+		if r.err != ErrReused || r.event.ConnectionID != g.id || f.valid(rotated.access) || len(f.connections("user")) != 0 {
+			t.Fatalf("err %v, event %+v", r.err, r.event)
+		}
+		f.refresh(rotated.refresh).rejected(t, 400, "invalid_grant")
+	})
+
+	// A first exchange that failed after consuming the code left no connection.
+	t.Run("after a failed exchange", func(t *testing.T) {
+		f := newFixture(t)
+		code := f.code(authParams(), "user")
+		form := exchangeForm(code)
+		form.Set("code_verifier", strings.Repeat("v", 43))
+		r := post(t, f.Token, form)
+		r.rejected(t, 400, "invalid_grant")
+		if errors.Is(r.err, ErrReused) {
+			t.Fatalf("first exchange: %v", r.err)
+		}
+		r = post(t, f.Token, exchangeForm(code))
+		r.rejected(t, 400, "invalid_grant")
+		if r.err != ErrReused || r.event != (Event{Grant: "authorization_code", ClientID: "public"}) || f.store.calls["Create"] != 0 {
+			t.Fatalf("err %v, event %+v", r.err, r.event)
+		}
+	})
+
+	// From its deadline on the code is only invalid and revokes nothing.
+	t.Run("after expiry", func(t *testing.T) {
+		f := newFixture(t)
+		code := f.code(authParams(), "user")
+		g := granted(t, post(t, f.Token, exchangeForm(code)))
+		f.advance(codeTTL)
+		for range 2 {
+			r := post(t, f.Token, exchangeForm(code))
+			r.rejected(t, 400, "invalid_grant")
+			if errors.Is(r.err, ErrReused) || r.event.ConnectionID != "" || r.event.Subject != "" {
+				t.Fatalf("err %v, event %+v", r.err, r.event)
+			}
+			// The record is deleted, so an earlier clock changes nothing.
+			f.advance(-time.Minute)
+		}
+		if !f.valid(g.access) {
+			t.Fatal("an expired code revoked the connection")
+		}
+		granted(t, f.refresh(g.refresh))
+	})
+
+	// A request that fails before the store is reached revokes nothing.
+	t.Run("rejected before the store", func(t *testing.T) {
+		f := newFixture(t)
+		code := f.code(authParams(), "user")
+		g := granted(t, post(t, f.Token, exchangeForm(code)))
+		before := f.store.calls["TakeCode"]
+		for name, tc := range map[string]struct {
+			change func(url.Values)
+			status int
+			want   string
+		}{
+			"unauthenticated client": {func(v url.Values) { v.Set("client_id", "confidential") }, 401, "invalid_client"},
+			"missing verifier":       {func(v url.Values) { v.Del("code_verifier") }, 400, "invalid_request"},
+			"malformed verifier":     {func(v url.Values) { v.Set("code_verifier", "short") }, 400, "invalid_grant"},
+			"malformed code":         {func(v url.Values) { v.Set("code", v.Get("code")+"=") }, 400, "invalid_grant"},
+			"other resource":         {func(v url.Values) { v.Set("resource", testIssuer) }, 400, "invalid_target"},
+		} {
+			form := exchangeForm(code)
+			tc.change(form)
+			r := post(t, f.Token, form)
+			r.rejected(t, tc.status, tc.want)
+			if errors.Is(r.err, ErrReused) || r.event.ConnectionID != "" || f.store.calls["TakeCode"] != before {
+				t.Fatalf("%s: err %v, event %+v", name, r.err, r.event)
+			}
+		}
+		if !f.valid(g.access) {
+			t.Fatal("a rejected request revoked the connection")
+		}
+		granted(t, f.refresh(g.refresh))
+	})
+}
+
+// TestCodeReuseBeforeCreate covers what reaches the store between the
+// consumption of a code and the creation of its connection.
+func TestCodeReuseBeforeCreate(t *testing.T) {
+	t.Run("code presented again", func(t *testing.T) {
+		f := newFixture(t)
+		code := f.code(authParams(), "user")
+		f.store.hook = map[string]func(){"Create": func() {
+			r := post(t, f.Token, exchangeForm(code))
+			r.rejected(t, 400, "invalid_grant")
+			if r.err != ErrReused || r.event != (Event{Grant: "authorization_code", ClientID: "public"}) {
+				t.Errorf("second exchange: err %v, event %+v", r.err, r.event)
+			}
+		}}
+		r := post(t, f.Token, exchangeForm(code))
+		r.rejected(t, 400, "invalid_grant")
+		if r.err != ErrReused || r.event != (Event{Grant: "authorization_code", ClientID: "public", Subject: "user"}) {
+			t.Fatalf("first exchange: err %v, event %+v", r.err, r.event)
+		}
+		if f.store.calls["Create"] != 1 || len(f.connections("user")) != 0 {
+			t.Fatalf("%d creations, %d connections", f.store.calls["Create"], len(f.connections("user")))
+		}
+	})
+
+	t.Run("record deleted", func(t *testing.T) {
+		f := newFixture(t)
+		existing := f.connect("user")
+		code := f.code(authParams(), "user")
+		f.store.hook = map[string]func(){"Create": func() {
+			if err := f.store.RevokeSubject(t.Context(), "user"); err != nil {
+				t.Error(err)
+			}
+		}}
+		r := post(t, f.Token, exchangeForm(code))
+		r.rejected(t, 400, "invalid_grant")
+		if errors.Is(r.err, ErrReused) || r.event.ConnectionID != "" {
+			t.Fatalf("err %v, event %+v", r.err, r.event)
+		}
+		if f.store.calls["Create"] != 2 || len(f.connections("user")) != 0 || f.valid(existing.access) {
+			t.Fatalf("%d creations, %d connections", f.store.calls["Create"], len(f.connections("user")))
+		}
+		// With the record gone a retry is a plain failure.
+		r = post(t, f.Token, exchangeForm(code))
+		r.rejected(t, 400, "invalid_grant")
+		if errors.Is(r.err, ErrReused) {
+			t.Fatalf("retry: %v", r.err)
+		}
+	})
 }
 
 func TestClientAuthentication(t *testing.T) {
@@ -623,8 +834,10 @@ func TestRefreshOtherClient(t *testing.T) {
 	f := newFixture(t)
 	g := f.connect("user")
 	rotated := granted(t, f.refresh(g.refresh))
-	// Neither the current nor a rotated token of another client's connection
-	// changes it, so a client cannot revoke connections it does not own.
+	// Neither the current nor a rotated refresh token of another client's
+	// connection changes it, so a client cannot revoke connections it does
+	// not own by refreshing. A consumed authorization code is different: it
+	// revokes the connection whichever client presents it.
 	for _, token := range []string{rotated.refresh, g.refresh} {
 		form := refreshForm(token)
 		form.Del("client_id")

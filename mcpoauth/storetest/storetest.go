@@ -26,8 +26,14 @@ func Run(t *testing.T, newStore func(t *testing.T) mcpoauth.Store) {
 		{"code expiry", codeExpiry},
 		{"code collision", codeCollision},
 		{"concurrent code consumption", codeConcurrent},
+		{"code reuse", codeReused},
+		{"code reuse before the connection", codeReusedEarly},
+		{"code reuse after rotation", codeReusedRotated},
+		{"code reuse concurrent with creation", codeReusedConcurrent},
 		{"connection round trip", roundTrip},
 		{"connection collision", createCollision},
+		{"connection without a consumed code", createCode},
+		{"connection code collision", createCodeCollision},
 		{"rotation", rotate},
 		{"rotation of another client", rotateOtherClient},
 		{"rotation after expiry", rotateExpired},
@@ -86,7 +92,7 @@ func same(t *testing.T, got, want mcpoauth.Connection) {
 		!got.CreatedAt.Equal(want.CreatedAt) || !got.RefreshedAt.Equal(want.RefreshedAt) ||
 		!got.AbsoluteExpiry.Equal(want.AbsoluteExpiry) || got.AbsoluteExpiry.IsZero() != want.AbsoluteExpiry.IsZero() ||
 		got.Access != want.Access || !got.AccessExpiry.Equal(want.AccessExpiry) ||
-		got.Refresh != want.Refresh || !got.RefreshExpiry.Equal(want.RefreshExpiry) {
+		got.Refresh != want.Refresh || !got.RefreshExpiry.Equal(want.RefreshExpiry) || got.Code != want.Code {
 		t.Fatalf("connection\n got %+v\nwant %+v", got, want)
 	}
 }
@@ -121,24 +127,58 @@ func absent(t *testing.T, store mcpoauth.Store, conn mcpoauth.Connection, now ti
 	}
 }
 
+// consumed stores code n, which expires at second 60, and takes it at second
+// 1, so that a connection can be created from it.
+func consumed(t *testing.T, store mcpoauth.Store, n int) mcpoauth.Key {
+	t.Helper()
+	k := key('c', n)
+	if err := store.CreateCode(t.Context(), k, code(at(60))); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.TakeCode(t.Context(), k, at(1)); err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+// reused requires a failed take that reports reuse and deleted no connection.
+func reused(t *testing.T, conn mcpoauth.Connection, err error) {
+	t.Helper()
+	if !errors.Is(err, mcpoauth.ErrReused) || !errors.Is(err, mcpoauth.ErrInvalid) || conn.ID != "" {
+		t.Fatalf("take of a consumed code: %+v, %v", conn, err)
+	}
+}
+
+// invalid requires a failed take that is not reported as reuse.
+func invalid(t *testing.T, conn mcpoauth.Connection, err error) {
+	t.Helper()
+	if !errors.Is(err, mcpoauth.ErrInvalid) || errors.Is(err, mcpoauth.ErrReused) || conn.ID != "" {
+		t.Fatalf("take of a missing or expired code: %+v, %v", conn, err)
+	}
+}
+
 func codeOnce(t *testing.T, store mcpoauth.Store) {
 	ctx, want := t.Context(), code(at(60))
 	if err := store.CreateCode(ctx, key('c', 1), want); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.TakeCode(ctx, key('c', 2), at(1)); !errors.Is(err, mcpoauth.ErrInvalid) {
-		t.Fatalf("unknown code: %v", err)
-	}
-	got, err := store.TakeCode(ctx, key('c', 1), at(59))
-	if err != nil {
-		t.Fatal(err)
+	_, conn, err := store.TakeCode(ctx, key('c', 2), at(1))
+	invalid(t, conn, err)
+	got, conn, err := store.TakeCode(ctx, key('c', 1), at(59))
+	if err != nil || conn.ID != "" {
+		t.Fatalf("first take: %+v, %v", conn, err)
 	}
 	if got.ClientID != want.ClientID || got.RedirectURI != want.RedirectURI || got.Subject != want.Subject ||
 		!slices.Equal(got.Scopes, want.Scopes) || got.Challenge != want.Challenge || !got.ExpiresAt.Equal(want.ExpiresAt) {
 		t.Fatalf("code\n got %+v\nwant %+v", got, want)
 	}
-	if _, err := store.TakeCode(ctx, key('c', 1), at(1)); !errors.Is(err, mcpoauth.ErrInvalid) {
-		t.Fatalf("second take: %v", err)
+	// The record is kept until its deadline: every later take is reuse.
+	for range 2 {
+		again, conn, err := store.TakeCode(ctx, key('c', 1), at(59))
+		reused(t, conn, err)
+		if again.Subject != "" || again.ClientID != "" || len(again.Scopes) != 0 {
+			t.Fatalf("a reused take returned the code: %+v", again)
+		}
 	}
 }
 
@@ -147,12 +187,32 @@ func codeExpiry(t *testing.T, store mcpoauth.Store) {
 	if err := store.CreateCode(ctx, key('c', 1), code(at(60))); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.TakeCode(ctx, key('c', 1), at(60)); !errors.Is(err, mcpoauth.ErrInvalid) {
-		t.Fatalf("take at the deadline: %v", err)
-	}
-	if _, err := store.TakeCode(ctx, key('c', 1), at(1)); !errors.Is(err, mcpoauth.ErrInvalid) {
-		t.Fatalf("an expired take did not consume the code: %v", err)
-	}
+	_, conn, err := store.TakeCode(ctx, key('c', 1), at(60))
+	invalid(t, conn, err)
+	// The expired record is deleted: an earlier clock finds nothing.
+	_, conn, err = store.TakeCode(ctx, key('c', 1), at(1))
+	invalid(t, conn, err)
+
+	// At its deadline a consumed record is deleted as well. That is not
+	// reuse and it keeps the connection.
+	linked := connection(1)
+	linked.Code = consumed(t, store, 2)
+	create(t, store, linked)
+	_, conn, err = store.TakeCode(ctx, linked.Code, at(60))
+	invalid(t, conn, err)
+	present(t, store, linked, at(61))
+	_, conn, err = store.TakeCode(ctx, linked.Code, at(1))
+	invalid(t, conn, err)
+	present(t, store, linked, at(61))
+
+	// Neither does the deadline spare a record already marked as reused.
+	marked := consumed(t, store, 3)
+	_, conn, err = store.TakeCode(ctx, marked, at(2))
+	reused(t, conn, err)
+	_, conn, err = store.TakeCode(ctx, marked, at(60))
+	invalid(t, conn, err)
+	_, conn, err = store.TakeCode(ctx, marked, at(2))
+	invalid(t, conn, err)
 }
 
 func codeCollision(t *testing.T, store mcpoauth.Store) {
@@ -165,7 +225,7 @@ func codeCollision(t *testing.T, store mcpoauth.Store) {
 	if err := store.CreateCode(ctx, key('c', 1), other); !errors.Is(err, mcpoauth.ErrCollision) {
 		t.Fatalf("duplicate key: %v", err)
 	}
-	got, err := store.TakeCode(ctx, key('c', 1), at(1))
+	got, _, err := store.TakeCode(ctx, key('c', 1), at(1))
 	if err != nil || got.Subject != "user" {
 		t.Fatalf("a collision changed the stored code: %+v, %v", got, err)
 	}
@@ -182,11 +242,11 @@ func codeConcurrent(t *testing.T, store mcpoauth.Store) {
 	for range 16 {
 		wg.Go(func() {
 			<-begin
-			switch _, err := store.TakeCode(ctx, key('c', 1), at(1)); {
+			switch _, conn, err := store.TakeCode(ctx, key('c', 1), at(1)); {
 			case err == nil:
 				taken.Add(1)
-			case !errors.Is(err, mcpoauth.ErrInvalid):
-				t.Error(err)
+			case !errors.Is(err, mcpoauth.ErrReused) || conn.ID != "":
+				t.Errorf("losing take: %+v, %v", conn, err)
 			}
 		})
 	}
@@ -195,11 +255,112 @@ func codeConcurrent(t *testing.T, store mcpoauth.Store) {
 	if taken.Load() != 1 {
 		t.Fatalf("%d takes succeeded, want 1", taken.Load())
 	}
+	// A losing take marked the record, so no connection can follow.
+	conn := connection(1)
+	conn.Code = key('c', 1)
+	if err := store.Create(ctx, conn); !errors.Is(err, mcpoauth.ErrReused) {
+		t.Fatalf("connection from a reused code: %v", err)
+	}
+	absent(t, store, conn, at(1))
+}
+
+func codeReused(t *testing.T, store mcpoauth.Store) {
+	ctx, conn, other, plain := t.Context(), connection(1), connection(2), connection(3)
+	conn.Code, other.Code = consumed(t, store, 1), consumed(t, store, 2)
+	create(t, store, conn, other, plain)
+	got, deleted, err := store.TakeCode(ctx, conn.Code, at(2))
+	if !errors.Is(err, mcpoauth.ErrReused) || !errors.Is(err, mcpoauth.ErrInvalid) || got.Subject != "" {
+		t.Fatalf("consumed code: %+v, %v", got, err)
+	}
+	same(t, deleted, conn)
+	// The deletion is committed.
+	absent(t, store, conn, at(3))
+	if _, err := store.Rotate(ctx, conn.Selector, conn.Refresh, "client", at(3), rotation(1, 3)); !errors.Is(err, mcpoauth.ErrInvalid) || errors.Is(err, mcpoauth.ErrReused) {
+		t.Fatalf("rotation after code reuse: %v", err)
+	}
+	// Later takes find no connection, and the mark refuses a new one.
+	_, deleted, err = store.TakeCode(ctx, conn.Code, at(4))
+	reused(t, deleted, err)
+	if err := store.Create(ctx, conn); !errors.Is(err, mcpoauth.ErrReused) {
+		t.Fatalf("connection from a reused code: %v", err)
+	}
+	absent(t, store, conn, at(5))
+	present(t, store, other, at(5))
+	present(t, store, plain, at(5))
+}
+
+func codeReusedEarly(t *testing.T, store mcpoauth.Store) {
+	ctx, conn := t.Context(), connection(1)
+	conn.Code = consumed(t, store, 1)
+	_, deleted, err := store.TakeCode(ctx, conn.Code, at(2))
+	reused(t, deleted, err)
+	if err := store.Create(ctx, conn); !errors.Is(err, mcpoauth.ErrReused) || !errors.Is(err, mcpoauth.ErrInvalid) {
+		t.Fatalf("connection from a reused code: %v", err)
+	}
+	absent(t, store, conn, at(3))
+	// Nothing of the refused connection was stored.
+	conn.Code = mcpoauth.Key{}
+	create(t, store, conn)
+}
+
+func codeReusedRotated(t *testing.T, store mcpoauth.Store) {
+	ctx, conn := t.Context(), connection(1)
+	conn.Code = consumed(t, store, 1)
+	create(t, store, conn)
+	next := rotation(1, 10)
+	want := conn
+	want.Access, want.AccessExpiry = next.Access, next.AccessExpiry
+	want.Refresh, want.RefreshExpiry = next.Refresh, next.RefreshExpiry
+	want.RefreshedAt = at(10)
+	got, err := store.Rotate(ctx, conn.Selector, conn.Refresh, "client", at(10), next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same(t, got, want)
+	present(t, store, want, at(11))
+	if got, err = store.Use(ctx, next.Access, at(11)); err != nil {
+		t.Fatal(err)
+	}
+	same(t, got, want)
+	_, deleted, err := store.TakeCode(ctx, conn.Code, at(12))
+	if !errors.Is(err, mcpoauth.ErrReused) {
+		t.Fatalf("consumed code after rotation: %v", err)
+	}
+	same(t, deleted, want)
+	absent(t, store, want, at(13))
+}
+
+// codeReusedConcurrent races the creation of a connection against a second
+// take of its code. Whichever comes first, no connection remains.
+func codeReusedConcurrent(t *testing.T, store mcpoauth.Store) {
+	ctx := t.Context()
+	for i := range 64 {
+		conn := connection(1)
+		conn.Code = consumed(t, store, i)
+		var wg sync.WaitGroup
+		begin := make(chan struct{})
+		wg.Go(func() {
+			<-begin
+			if err := store.Create(ctx, conn); err != nil && !errors.Is(err, mcpoauth.ErrReused) {
+				t.Errorf("create: %v", err)
+			}
+		})
+		wg.Go(func() {
+			<-begin
+			if _, _, err := store.TakeCode(ctx, conn.Code, at(2)); !errors.Is(err, mcpoauth.ErrReused) {
+				t.Errorf("take of a consumed code: %v", err)
+			}
+		})
+		close(begin)
+		wg.Wait()
+		absent(t, store, conn, at(3))
+	}
 }
 
 func roundTrip(t *testing.T, store mcpoauth.Store) {
 	ctx, conn := t.Context(), connection(1)
 	conn.AbsoluteExpiry = at(5000)
+	conn.Code = consumed(t, store, 1)
 	create(t, store, conn)
 	present(t, store, conn, at(1))
 	got, err := store.Use(ctx, conn.Access, at(1))
@@ -249,6 +410,72 @@ func createCollision(t *testing.T, store mcpoauth.Store) {
 		}
 	}
 	create(t, store, connection(2))
+}
+
+// createCode checks that a connection with a Code needs the consumed record.
+func createCode(t *testing.T, store mcpoauth.Store) {
+	ctx := t.Context()
+	if err := store.CreateCode(ctx, key('c', 2), code(at(60))); err != nil {
+		t.Fatal(err)
+	}
+	for name, k := range map[string]mcpoauth.Key{"missing": key('c', 1), "unconsumed": key('c', 2)} {
+		conn := connection(1)
+		conn.Code = k
+		if err := store.Create(ctx, conn); !errors.Is(err, mcpoauth.ErrInvalid) || errors.Is(err, mcpoauth.ErrReused) {
+			t.Fatalf("connection from a %s code: %v", name, err)
+		}
+		absent(t, store, conn, at(1))
+	}
+	// The refusal neither created nor consumed a record.
+	_, deleted, err := store.TakeCode(ctx, key('c', 1), at(1))
+	invalid(t, deleted, err)
+	if _, _, err := store.TakeCode(ctx, key('c', 2), at(1)); err != nil {
+		t.Fatalf("a refused connection consumed the code: %v", err)
+	}
+	conn := connection(1)
+	conn.Code = key('c', 2)
+	create(t, store, conn)
+	present(t, store, conn, at(1))
+
+	// A record deleted at its deadline refuses the connection as a missing one.
+	late := connection(2)
+	late.Code = consumed(t, store, 3)
+	_, deleted, err = store.TakeCode(ctx, late.Code, at(60))
+	invalid(t, deleted, err)
+	if err := store.Create(ctx, late); !errors.Is(err, mcpoauth.ErrInvalid) || errors.Is(err, mcpoauth.ErrReused) {
+		t.Fatalf("connection from a deleted code: %v", err)
+	}
+	absent(t, store, late, at(1))
+}
+
+func createCodeCollision(t *testing.T, store mcpoauth.Store) {
+	ctx, first := t.Context(), connection(1)
+	first.Code = consumed(t, store, 1)
+	create(t, store, first)
+	second := connection(2)
+	second.Code = first.Code
+	if err := store.Create(ctx, second); !errors.Is(err, mcpoauth.ErrCollision) {
+		t.Fatalf("duplicate Code: %v", err)
+	}
+	present(t, store, first, at(1))
+	absent(t, store, second, at(1))
+
+	// The zero Code links no code: any number of connections may carry it,
+	// and a reused record stored under the zero key deletes none of them.
+	plain, other := connection(3), connection(4)
+	create(t, store, plain, other)
+	if err := store.CreateCode(ctx, mcpoauth.Key{}, code(at(60))); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.TakeCode(ctx, mcpoauth.Key{}, at(1)); err != nil {
+		t.Fatal(err)
+	}
+	_, deleted, err := store.TakeCode(ctx, mcpoauth.Key{}, at(2))
+	reused(t, deleted, err)
+	present(t, store, plain, at(3))
+	present(t, store, other, at(3))
+	create(t, store, connection(5))
+	present(t, store, first, at(3))
 }
 
 func rotate(t *testing.T, store mcpoauth.Store) {
@@ -496,14 +723,24 @@ func canceled(t *testing.T, store mcpoauth.Store) {
 			t.Fatalf("%s with a canceled context: %v", name, err)
 		}
 	}
-	conn, pending := connection(1), connection(2)
+	conn, pending, linked, later := connection(1), connection(2), connection(3), connection(4)
 	create(t, store, conn)
 	if err := store.CreateCode(t.Context(), key('c', 1), code(at(60))); err != nil {
 		t.Fatal(err)
 	}
+	linked.Code, later.Code = consumed(t, store, 3), consumed(t, store, 4)
+	create(t, store, linked)
 
 	check("CreateCode", store.CreateCode(ctx, key('c', 2), code(at(60))))
-	_, err := store.TakeCode(ctx, key('c', 1), at(1))
+	_, _, err := store.TakeCode(ctx, key('c', 1), at(1))
+	check("TakeCode", err)
+	// A consumed code would be marked, and its connection deleted, if the
+	// call ran. An expired one would be deleted.
+	_, _, err = store.TakeCode(ctx, linked.Code, at(2))
+	check("TakeCode", err)
+	_, _, err = store.TakeCode(ctx, later.Code, at(2))
+	check("TakeCode", err)
+	_, _, err = store.TakeCode(ctx, later.Code, at(60))
 	check("TakeCode", err)
 	check("Create", store.Create(ctx, pending))
 	// A wrong refresh token would delete the connection if the call ran.
@@ -522,10 +759,14 @@ func canceled(t *testing.T, store mcpoauth.Store) {
 		t.Fatalf("a canceled call changed the access token: %v", err)
 	}
 	absent(t, store, pending, at(1))
-	if _, err := store.TakeCode(t.Context(), key('c', 2), at(1)); !errors.Is(err, mcpoauth.ErrInvalid) {
+	if _, _, err := store.TakeCode(t.Context(), key('c', 2), at(1)); !errors.Is(err, mcpoauth.ErrInvalid) {
 		t.Fatalf("a canceled CreateCode stored a code: %v", err)
 	}
-	if _, err := store.TakeCode(t.Context(), key('c', 1), at(1)); err != nil {
+	if _, _, err := store.TakeCode(t.Context(), key('c', 1), at(1)); err != nil {
 		t.Fatalf("a canceled TakeCode consumed the code: %v", err)
+	}
+	present(t, store, linked, at(1))
+	if err := store.Create(t.Context(), later); err != nil {
+		t.Fatalf("a canceled TakeCode marked or deleted the code: %v", err)
 	}
 }

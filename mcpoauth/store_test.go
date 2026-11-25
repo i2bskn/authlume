@@ -38,17 +38,25 @@ func memoryConnection(n int, subject string, created time.Time) mcpoauth.Connect
 
 func TestMemoryStoreCodeCapacity(t *testing.T) {
 	store, ctx := mcpoauth.NewMemoryStore(), context.Background()
-	live := time.Now().Add(time.Hour)
+	live, expired := time.Now().Add(time.Hour), time.Now().Add(-time.Second)
 	for i := range 4096 {
 		code := mcpoauth.Code{Subject: "user", ExpiresAt: live}
 		if i < 8 {
-			code.ExpiresAt = time.Now().Add(-time.Second)
+			code.ExpiresAt = expired
 		}
 		if err := store.CreateCode(ctx, numbered('c', i), code); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// A full store reclaims the eight expired codes, then refuses the ninth.
+	// Half of the codes that expire were exchanged before their deadline, and
+	// so was a live one. A consumed record keeps its slot until its deadline.
+	for _, i := range []int{0, 1, 2, 3, 100} {
+		if _, _, err := store.TakeCode(ctx, numbered('c', i), expired.Add(-time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A full store reclaims the eight expired codes, consumed or not, then
+	// refuses the ninth.
 	for i := range 8 {
 		if err := store.CreateCode(ctx, numbered('n', i), mcpoauth.Code{ExpiresAt: live}); err != nil {
 			t.Fatalf("expired codes not reclaimed: %v", err)
@@ -60,11 +68,16 @@ func TestMemoryStoreCodeCapacity(t *testing.T) {
 	if err := store.CreateCode(ctx, numbered('c', 100), mcpoauth.Code{ExpiresAt: live}); !errors.Is(err, mcpoauth.ErrCollision) {
 		t.Fatalf("duplicate in a full store: %v", err)
 	}
-	if _, err := store.TakeCode(ctx, numbered('c', 100), time.Now()); err != nil {
-		t.Fatal(err)
+	// The consumed live code is still stored: presenting it again is reuse.
+	if _, _, err := store.TakeCode(ctx, numbered('c', 100), time.Now()); !errors.Is(err, mcpoauth.ErrReused) {
+		t.Fatalf("consumed code in a full store: %v", err)
 	}
-	if err := store.CreateCode(ctx, numbered('n', 8), mcpoauth.Code{ExpiresAt: live}); err != nil {
-		t.Fatalf("slot of a consumed code: %v", err)
+	if err := store.CreateCode(ctx, numbered('n', 8), mcpoauth.Code{ExpiresAt: live}); !errors.Is(err, mcpoauth.ErrCapacity) {
+		t.Fatalf("a consumed code gave up its slot: %v", err)
+	}
+	// The reclaimed consumed codes are gone rather than reused.
+	if _, _, err := store.TakeCode(ctx, numbered('c', 0), expired.Add(-time.Minute)); !errors.Is(err, mcpoauth.ErrInvalid) || errors.Is(err, mcpoauth.ErrReused) {
+		t.Fatalf("reclaimed consumed code: %v", err)
 	}
 }
 
@@ -177,8 +190,34 @@ func TestMemoryStoreRevokeSubject(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// A consumed code of each subject, with an exchange still in progress.
+	for n, subject := range map[int]string{10: "user", 11: "other"} {
+		if err := store.CreateCode(ctx, numbered('c', n), mcpoauth.Code{Subject: subject, ExpiresAt: now.Add(time.Minute)}); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.TakeCode(ctx, numbered('c', n), now); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := store.RevokeSubject(ctx, "user"); err != nil {
 		t.Fatal(err)
+	}
+	// The consumed record is deleted too, which stops the pending connection.
+	pending := memoryConnection(10, "user", now)
+	pending.Code = numbered('c', 10)
+	if err := store.Create(ctx, pending); !errors.Is(err, mcpoauth.ErrInvalid) || errors.Is(err, mcpoauth.ErrReused) {
+		t.Fatalf("connection from a revoked subject's consumed code: %v", err)
+	}
+	if _, err := store.Lookup(ctx, pending.Selector, now); !errors.Is(err, mcpoauth.ErrInvalid) {
+		t.Fatalf("a refused connection was stored: %v", err)
+	}
+	if _, _, err := store.TakeCode(ctx, numbered('c', 10), now); !errors.Is(err, mcpoauth.ErrInvalid) || errors.Is(err, mcpoauth.ErrReused) {
+		t.Fatalf("consumed code of a revoked subject: %v", err)
+	}
+	surviving := memoryConnection(11, "other", now)
+	surviving.Code = numbered('c', 11)
+	if err := store.Create(ctx, surviving); err != nil {
+		t.Fatalf("another subject's consumed code: %v", err)
 	}
 	for n := range 2 {
 		if _, err := store.Use(ctx, numbered('a', n), now); !errors.Is(err, mcpoauth.ErrInvalid) {
@@ -187,14 +226,14 @@ func TestMemoryStoreRevokeSubject(t *testing.T) {
 		if _, err := store.Lookup(ctx, numbered('s', n), now); !errors.Is(err, mcpoauth.ErrInvalid) {
 			t.Fatalf("connection of a revoked subject: %v", err)
 		}
-		if _, err := store.TakeCode(ctx, numbered('c', n), now); !errors.Is(err, mcpoauth.ErrInvalid) {
+		if _, _, err := store.TakeCode(ctx, numbered('c', n), now); !errors.Is(err, mcpoauth.ErrInvalid) {
 			t.Fatalf("code of a revoked subject: %v", err)
 		}
 	}
 	if _, err := store.Use(ctx, numbered('a', 2), now); err != nil {
 		t.Fatalf("another subject's connection: %v", err)
 	}
-	if _, err := store.TakeCode(ctx, numbered('c', 2), now); err != nil {
+	if _, _, err := store.TakeCode(ctx, numbered('c', 2), now); err != nil {
 		t.Fatalf("another subject's code: %v", err)
 	}
 }

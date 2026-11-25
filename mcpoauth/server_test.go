@@ -40,16 +40,23 @@ type faultStore struct {
 	calls map[string]int
 	code  func(*Code)
 	conn  func(*Connection)
+	// hook runs once, just before the named method reaches the MemoryStore.
+	hook map[string]func()
 }
 
 func (s *faultStore) enter(method string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.calls == nil {
 		s.calls = make(map[string]int)
 	}
 	s.calls[method]++
-	return s.fail[method]
+	err, hook := s.fail[method], s.hook[method]
+	delete(s.hook, method)
+	s.mu.Unlock()
+	if err == nil && hook != nil {
+		hook()
+	}
+	return err
 }
 
 func (s *faultStore) total() int {
@@ -76,15 +83,15 @@ func (s *faultStore) CreateCode(ctx context.Context, key Key, code Code) error {
 	return s.MemoryStore.CreateCode(ctx, key, code)
 }
 
-func (s *faultStore) TakeCode(ctx context.Context, key Key, now time.Time) (Code, error) {
+func (s *faultStore) TakeCode(ctx context.Context, key Key, now time.Time) (Code, Connection, error) {
 	if err := s.enter("TakeCode"); err != nil {
-		return Code{}, err
+		return Code{}, Connection{}, err
 	}
-	code, err := s.MemoryStore.TakeCode(ctx, key, now)
+	code, conn, err := s.MemoryStore.TakeCode(ctx, key, now)
 	if err == nil && s.code != nil {
 		s.code(&code)
 	}
-	return code, err
+	return code, conn, err
 }
 
 func (s *faultStore) Create(ctx context.Context, conn Connection) error {
@@ -531,9 +538,14 @@ func TestStoreFailures(t *testing.T) {
 					if r.event.ConnectionID != "" || r.event.Grant != "authorization_code" || r.event.ClientID != "public" {
 						t.Fatalf("event %+v", r.event)
 					}
-					// The code was consumed before the failure.
+					// The code was consumed before the failure, so a retry is
+					// reuse that finds no connection.
 					delete(f.store.fail, method)
-					post(t, f.Token, exchangeForm(code)).rejected(t, 400, "invalid_grant")
+					r = post(t, f.Token, exchangeForm(code))
+					r.rejected(t, 400, "invalid_grant")
+					if r.err != ErrReused || r.event.ConnectionID != "" || r.event.Subject != "" {
+						t.Fatalf("retry: err %v, event %+v", r.err, r.event)
+					}
 				case "Rotate":
 					f.refresh(g.refresh).unavailable(t, cause)
 					delete(f.store.fail, method)

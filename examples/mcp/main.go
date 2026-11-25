@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -100,10 +101,13 @@ func demo(origin, secret string, client mcpoauth.Client, store *mcpoauth.MemoryS
 	api.HandleFunc("GET "+oauth.ResourceMetadataPath(), oauth.ResourceMetadata)
 	// Some clients look for the resource metadata at the root.
 	api.HandleFunc("GET /.well-known/oauth-protected-resource", oauth.ResourceMetadata)
-	api.Handle("GET /mcp", oauth.Protect(http.HandlerFunc(a.describe), "mcp:read"))
-	api.Handle("POST /mcp", oauth.Protect(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}), "mcp:write"))
+	// Every MCP request is a POST. The endpoint offers no server-initiated
+	// stream, so an authenticated GET is answered with 405.
+	api.Handle("POST /mcp", oauth.Protect(http.HandlerFunc(a.mcp), "mcp:read"))
+	api.Handle("GET /mcp", oauth.Protect(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Allow", http.MethodPost)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}), "mcp:read"))
 
 	root := http.NewServeMux()
 	for _, prefix := range []string{"/token", "/revoke", "/mcp", "/.well-known/"} {
@@ -121,8 +125,10 @@ func demo(origin, secret string, client mcpoauth.Client, store *mcpoauth.MemoryS
 func record(name string, handle func(http.ResponseWriter, *http.Request) (mcpoauth.Event, error), w http.ResponseWriter, r *http.Request) {
 	event, err := handle(w, r)
 	switch {
+	case errors.Is(err, mcpoauth.ErrReused) && event.ConnectionID != "":
+		log.Printf("%s: reuse revoked connection %s", name, event.ConnectionID)
 	case errors.Is(err, mcpoauth.ErrReused):
-		log.Printf("%s: refresh token reuse revoked connection %s", name, event.ConnectionID)
+		log.Printf("%s: reuse detected, no connection", name)
 	case err != nil:
 		log.Printf("%s: client %q: %v", name, event.ClientID, err)
 	}
@@ -335,19 +341,102 @@ func (a *app) disconnect(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-// describe stands in for an MCP method: it reports who the token acts for.
-// A real server also checks the user's current state and permissions.
-func (a *app) describe(w http.ResponseWriter, r *http.Request) {
+// protocolVersions are the MCP revisions the demo answers, newest first.
+var protocolVersions = []string{"2025-11-25", "2025-06-18", "2025-03-26"}
+
+const toolList = `[
+{"name":"whoami","description":"Reports the user, client and scopes the access token acts for.","inputSchema":{"type":"object","properties":{}}},
+{"name":"echo","description":"Returns the given text. Needs the mcp:write scope.","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}
+]`
+
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// mcp answers the few JSON-RPC methods a client needs to connect and call a
+// tool: initialize, ping, tools/list and tools/call. Every request has
+// already passed Protect with mcp:read. A real server also checks the
+// user's current state and permissions before each tool runs.
+func (a *app) mcp(w http.ResponseWriter, r *http.Request) {
 	access, ok := mcpoauth.FromContext(r.Context())
 	if !ok {
 		http.Error(w, "Access unavailable.", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
+	var req struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params"`
+	}
 	w.Header().Set("Cache-Control", "no-store")
-	if err := json.NewEncoder(w).Encode(map[string]any{
-		"subject": access.Subject, "client_id": access.ClientID, "scopes": access.Scopes,
-	}); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil || req.JSONRPC != "2.0" || req.Method == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}`))
+		return
+	}
+	if len(req.ID) == 0 { // a notification expects no reply
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	var result any
+	var failure *rpcError
+	switch req.Method {
+	case "initialize":
+		var params struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		}
+		_ = json.Unmarshal(req.Params, &params)
+		version := protocolVersions[0]
+		if slices.Contains(protocolVersions, params.ProtocolVersion) {
+			version = params.ProtocolVersion
+		}
+		result = map[string]any{"protocolVersion": version, "capabilities": map[string]any{"tools": struct{}{}},
+			"serverInfo": map[string]string{"name": "authlume-mcp-demo", "version": "0.0.0"}}
+	case "ping":
+		result = struct{}{}
+	case "tools/list":
+		result = map[string]any{"tools": json.RawMessage(toolList)}
+	case "tools/call":
+		var params struct {
+			Name      string `json:"name"`
+			Arguments struct {
+				Text string `json:"text"`
+			} `json:"arguments"`
+		}
+		_ = json.Unmarshal(req.Params, &params)
+		var text string
+		switch params.Name {
+		case "whoami":
+			raw, _ := json.Marshal(map[string]any{"subject": access.Subject, "client_id": access.ClientID, "scopes": access.Scopes})
+			text = string(raw)
+		case "echo":
+			// A tool may need more than the route does. The 403 challenge
+			// names the scope so that the client can ask the user for it.
+			if !access.Has("mcp:write") {
+				a.oauth.InsufficientScope(w, "mcp:write")
+				return
+			}
+			text = params.Arguments.Text
+		default:
+			failure = &rpcError{-32602, "Unknown tool"}
+		}
+		if failure == nil {
+			result = map[string]any{"content": []map[string]string{{"type": "text", "text": text}}}
+		}
+	default:
+		failure = &rpcError{-32601, "Method not found"}
+	}
+	reply := map[string]any{"jsonrpc": "2.0", "id": req.ID}
+	if failure != nil {
+		reply["error"] = failure
+	} else {
+		reply["result"] = result
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(reply); err != nil {
 		log.Printf("mcp: %v", err)
 	}
 }

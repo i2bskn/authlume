@@ -239,7 +239,7 @@ func TestApproveAndDeny(t *testing.T) {
 				t.Fatalf("request %+v", request)
 			}
 			code := check(redirect, "code").Get("code")
-			record, err := f.store.MemoryStore.TakeCode(t.Context(), f.key("code", code), f.now())
+			record, _, err := f.store.MemoryStore.TakeCode(t.Context(), f.key("code", code), f.now())
 			if err != nil {
 				t.Fatal(err)
 			}

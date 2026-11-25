@@ -40,6 +40,9 @@ type Connection struct {
 	AccessExpiry   time.Time
 	Refresh        Key
 	RefreshExpiry  time.Time
+	// Code is the digest of the authorization code that created the connection.
+	// The zero Key means no code is linked. Rotate never changes it.
+	Code Key
 }
 
 func (c Connection) absoluteExpired(now time.Time) bool {
@@ -70,30 +73,38 @@ type Rotation struct {
 // Store holds authorization codes and connections.
 //
 // Operations on the same code or connection must be linearizable, including
-// across processes. Dedicate a store to one Server configuration (one issuer
-// and resource pair): the key namespace is defense in depth, and Revoke and
-// subject-wide operations are not separated by it. Arrange physical cleanup
-// of expired records. Return backend failures as errors distinct from
-// ErrInvalid. Treat records as secrets and keep them out of logs. Preserve the
-// order of Scopes and at least whole seconds of every time; the location and
-// monotonic reading may be dropped.
+// across processes. A code and the connection created from it are operated on
+// together: the code record check, the uniqueness check and the insertion in
+// Create must be serialized with every TakeCode of the same conn.Code. Keep
+// codes and connections in one backend that can change both atomically.
+// Dedicate a store to one Server configuration (one issuer and resource
+// pair): the key namespace is defense in depth, and Revoke and subject-wide
+// operations are not separated by it. Arrange physical cleanup of expired
+// records. Return backend failures as errors distinct from ErrInvalid. Treat
+// records as secrets and keep them out of logs. Preserve the order of Scopes
+// and at least whole seconds of every time; the location and monotonic
+// reading may be dropped.
 //
 // Every method returns ctx.Err(), in a form errors.Is can identify, without
-// changing state when ctx is already done. The uniqueness of ID, Selector and
-// Access holds across the whole store.
+// changing state when ctx is already done. The uniqueness of ID, Selector,
+// Access and a nonzero Code holds across the whole store. The snapshots that
+// Rotate, Lookup and Use return keep Code.
 //
-// An operation that changes state while returning an error (the consumption
-// in TakeCode, the deletions in steps 3 and 4 of Rotate) must commit the
-// change before returning. Never roll a transaction back because of that
-// error. If the deletion cannot be committed, return the backend's error
-// instead of ErrInvalid or ErrReused.
+// An operation that changes state while returning an error (the deletion in
+// step 2 of TakeCode, the reuse mark and the deletion in its step 3, the
+// deletions in steps 3 and 4 of Rotate) must commit the change before
+// returning. Never roll a transaction back because of that error. If the
+// change cannot be committed, return the backend's error instead of
+// ErrInvalid or ErrReused.
 //
 // Listing and revoking by subject belong to the application's store:
 //
 //   - When revoking every connection of a subject, for account recovery or a
-//     takeover response, delete that subject's unconsumed codes in the same
-//     operation. A Create that follows a successful TakeCode cannot be
-//     stopped, so also check the subject's state as a precondition of Create.
+//     takeover response, delete every code record of that subject, consumed
+//     ones included, in the same operation. Deleting a consumed record also
+//     stops an exchange in progress: its Create finds no record and returns
+//     ErrInvalid. Checking the subject's state as a precondition of Create
+//     adds a second barrier.
 //   - Revoke the connections of a client whose registration is withdrawn. Use
 //     does not consult the client registration.
 //   - A repeated consent by the same subject and client adds a connection. It
@@ -102,12 +113,37 @@ type Store interface {
 	// CreateCode inserts without overwriting. Return ErrCollision when a
 	// record with the same key is stored. Expired records may be swept first.
 	CreateCode(ctx context.Context, key Key, code Code) error
-	// TakeCode consumes a record exactly once. Return ErrInvalid for a
-	// missing or expired record (now >= ExpiresAt). An expired record is
-	// consumed too. A failed retry cannot restore a record.
-	TakeCode(ctx context.Context, key Key, now time.Time) (Code, error)
-	// Create inserts a new connection. If its ID, Selector or Access equals
-	// that of a stored connection, change nothing and return ErrCollision.
+	// TakeCode evaluates the following in order as one atomic operation.
+	//
+	//  1. Without a record for key, return ErrInvalid.
+	//  2. If now >= ExpiresAt, delete the record and return ErrInvalid,
+	//     whether or not it was consumed or marked. Change no connection.
+	//  3. If the record is consumed, mark it as reused, delete the connection
+	//     whose Code equals key, if any, and return ErrReused together with
+	//     the snapshot before deletion, or with the zero Connection when
+	//     there was none. The mark stays until the record is deleted. A
+	//     connection with the zero Code never matches.
+	//  4. Mark the record as consumed and return its Code. Keep the record:
+	//     it stays until its deadline so that a replay is detected.
+	//
+	// Of concurrent calls with the same key, exactly one reaches step 4. The
+	// Code is nonzero only from step 4 and the Connection only when step 3
+	// deleted one.
+	TakeCode(ctx context.Context, key Key, now time.Time) (Code, Connection, error)
+	// Create inserts a new connection. It takes no time and evaluates no
+	// deadline. It checks the following in order.
+	//
+	//  1. With a nonzero conn.Code: without a record for that key, or with
+	//     an unconsumed one, change nothing and return ErrInvalid. With a
+	//     record marked as reused, change nothing and return ErrReused. A
+	//     zero conn.Code skips this step.
+	//  2. If its ID, Selector or Access, or its nonzero Code, equals that of
+	//     a stored connection, change nothing and return ErrCollision.
+	//  3. Insert the connection.
+	//
+	// Only the presence and state of the record decide step 1, so a record
+	// removed by expiry cleanup or by a subject-wide revocation refuses the
+	// connection.
 	Create(ctx context.Context, conn Connection) error
 	// Rotate evaluates the following in order as one atomic operation.
 	//
@@ -121,6 +157,7 @@ type Store interface {
 	//     nothing and return ErrCollision.
 	//  6. Replace Access, AccessExpiry, Refresh and RefreshExpiry with those
 	//     of next, set RefreshedAt to now and return the updated connection.
+	//     Every other member, Code included, is kept.
 	//
 	// Of concurrent calls with the same refresh, exactly one reaches step 6.
 	Rotate(ctx context.Context, selector, refresh Key, clientID string, now time.Time, next Rotation) (Connection, error)
@@ -143,17 +180,26 @@ const memoryCapacity = 4096
 // 4096 connections. Its zero value is ready to use.
 //
 // When a limit is reached, an insertion first reclaims expired records and
-// fails with ErrCapacity if none can be reclaimed. Codes live for 60 seconds,
-// so about 68 approvals per second fill the code limit. A connection occupies
+// fails with ErrCapacity if none can be reclaimed. A code record occupies its
+// slot until its deadline, exchanged or not. Codes live for 60 seconds, so
+// about 68 approvals per second fill the code limit. A connection occupies
 // its slot until it is revoked or its refresh deadline passes, which can take
 // the whole refresh idle lifetime, and every repeated consent adds one more.
 // All records are lost on restart.
 type MemoryStore struct {
 	mu        sync.Mutex
-	codes     map[Key]Code
+	codes     map[Key]codeRecord
 	conns     map[string]Connection
 	selectors map[Key]string
 	accesses  map[Key]string
+	linked    map[Key]string // nonzero Connection.Code to connection ID
+}
+
+// codeRecord is a stored code. A consumed record stays until its deadline.
+type codeRecord struct {
+	Code
+	consumed bool
+	reused   bool
 }
 
 // NewMemoryStore returns an empty, bounded single-process store.
@@ -169,6 +215,9 @@ func (s *MemoryStore) remove(conn Connection) {
 	delete(s.conns, conn.ID)
 	delete(s.selectors, conn.Selector)
 	delete(s.accesses, conn.Access)
+	if conn.Code != (Key{}) {
+		delete(s.linked, conn.Code)
+	}
 }
 
 func (s *MemoryStore) CreateCode(ctx context.Context, key Key, code Code) error {
@@ -192,25 +241,43 @@ func (s *MemoryStore) CreateCode(ctx context.Context, key Key, code Code) error 
 		}
 	}
 	if s.codes == nil {
-		s.codes = make(map[Key]Code)
+		s.codes = make(map[Key]codeRecord)
 	}
 	code.Scopes = slices.Clone(code.Scopes)
-	s.codes[key] = code
+	s.codes[key] = codeRecord{Code: code}
 	return nil
 }
 
-func (s *MemoryStore) TakeCode(ctx context.Context, key Key, now time.Time) (Code, error) {
+func (s *MemoryStore) TakeCode(ctx context.Context, key Key, now time.Time) (Code, Connection, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return Code{}, err
+		return Code{}, Connection{}, err
 	}
-	code, ok := s.codes[key]
-	delete(s.codes, key)
-	if !ok || !now.Before(code.ExpiresAt) {
-		return Code{}, ErrInvalid
+	record, ok := s.codes[key]
+	if !ok {
+		return Code{}, Connection{}, ErrInvalid
 	}
-	return code, nil
+	if !now.Before(record.ExpiresAt) {
+		delete(s.codes, key)
+		return Code{}, Connection{}, ErrInvalid
+	}
+	if record.consumed {
+		record.reused = true
+		s.codes[key] = record
+		id, ok := s.linked[key]
+		if !ok {
+			return Code{}, Connection{}, ErrReused
+		}
+		conn := s.conns[id]
+		s.remove(conn)
+		return Code{}, snapshot(conn), ErrReused
+	}
+	record.consumed = true
+	s.codes[key] = record
+	code := record.Code
+	code.Scopes = slices.Clone(code.Scopes)
+	return code, Connection{}, nil
 }
 
 func (s *MemoryStore) Create(ctx context.Context, conn Connection) error {
@@ -219,10 +286,21 @@ func (s *MemoryStore) Create(ctx context.Context, conn Connection) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	coded := conn.Code != (Key{})
+	if coded {
+		record, ok := s.codes[conn.Code]
+		if !ok || !record.consumed {
+			return ErrInvalid
+		}
+		if record.reused {
+			return ErrReused
+		}
+	}
 	_, id := s.conns[conn.ID]
 	_, selector := s.selectors[conn.Selector]
 	_, access := s.accesses[conn.Access]
-	if id || selector || access {
+	_, code := s.linked[conn.Code]
+	if id || selector || access || (coded && code) {
 		return ErrCollision
 	}
 	if len(s.conns) >= memoryCapacity {
@@ -239,10 +317,14 @@ func (s *MemoryStore) Create(ctx context.Context, conn Connection) error {
 		s.conns = make(map[string]Connection)
 		s.selectors = make(map[Key]string)
 		s.accesses = make(map[Key]string)
+		s.linked = make(map[Key]string)
 	}
 	s.conns[conn.ID] = snapshot(conn)
 	s.selectors[conn.Selector] = conn.ID
 	s.accesses[conn.Access] = conn.ID
+	if coded {
+		s.linked[conn.Code] = conn.ID
+	}
 	return nil
 }
 
@@ -338,8 +420,8 @@ func (s *MemoryStore) Connections(ctx context.Context, subject string, now time.
 	return conns, nil
 }
 
-// RevokeSubject deletes every connection and every unconsumed authorization
-// code of subject in one operation.
+// RevokeSubject deletes every connection and every code record of subject,
+// consumed ones included, in one operation.
 func (s *MemoryStore) RevokeSubject(ctx context.Context, subject string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

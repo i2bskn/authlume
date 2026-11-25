@@ -56,7 +56,7 @@ If the method returns `session.ErrCookieWellFormed`, use the normal logout flow.
 
 ## MCP OAuth
 
-The `mcpoauth` package is an OAuth 2.1 authorization server and bearer token verifier for one MCP server. It is independent of web login: the application keeps its own sign-in, consent screen and client registration, and resolves clients through a `mcpoauth.ClientLookup`. Registering a client grants nothing. Access starts with a user's consent, which creates one connection.
+The `mcpoauth` package is an OAuth 2.1 authorization server and bearer token verifier for one MCP server. It is independent of web login: the application keeps its own sign-in, consent screen and client registration, and resolves clients through a `mcpoauth.ClientLookup`. Registering a client grants nothing. Access starts with a user's consent, which creates one connection. An authorization code that is presented again before it expires revokes the connection created from it.
 
 ```go
 oauth, err := mcpoauth.New(mcpoauth.Config{

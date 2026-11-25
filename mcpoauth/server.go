@@ -10,7 +10,9 @@
 //
 // Tokens are opaque random values. Access tokens live for one hour by default
 // and are renewed with a rotating refresh token. A rotated refresh token that
-// is presented again revokes that connection only, without a grace period.
+// is presented again revokes that connection only, without a grace period. An
+// authorization code that is presented again before it expires revokes the
+// connection created from it in the same way.
 //
 // Deviations and extensions that an integrator should know:
 //
@@ -57,9 +59,10 @@ var (
 	ErrInvalid = errors.New("mcpoauth: invalid request, code or token")
 	// ErrClient wraps ErrInvalid and reports failed client authentication.
 	ErrClient = fmt.Errorf("%w: client authentication failed", ErrInvalid)
-	// ErrReused wraps ErrInvalid. A rotated refresh token was presented and
-	// its connection has been revoked.
-	ErrReused = fmt.Errorf("%w: refresh token reuse", ErrInvalid)
+	// ErrReused wraps ErrInvalid. A rotated refresh token or a consumed
+	// authorization code was presented. When that revoked a connection, it
+	// is named in Event.ConnectionID.
+	ErrReused = fmt.Errorf("%w: refresh token or authorization code reuse", ErrInvalid)
 	// ErrNotFound is returned by ClientLookup for an unregistered client.
 	ErrNotFound = errors.New("mcpoauth: client not found")
 	// ErrRecord reports an invalid record from the Store or ClientLookup.

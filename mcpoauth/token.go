@@ -149,12 +149,16 @@ func (s *Server) authenticate(r *http.Request, values url.Values) (Client, *fail
 // refresh_token grants. It always writes the response. The returned values
 // are for the application's records: err is nil on success, wraps ErrInvalid
 // for a failure caused by the client (ErrClient for failed client
-// authentication, ErrReused for a detected refresh token reuse) and is any
-// other error for a backend failure, which is answered with 503.
+// authentication, ErrReused for a detected reuse of a refresh token or an
+// authorization code) and is any other error for a backend failure, which is
+// answered with 503.
 //
 // A refresh rotates the access and refresh tokens atomically. Presenting a
 // rotated refresh token revokes that connection, so a client that retries a
-// refresh whose response it lost must be authorized again.
+// refresh whose response it lost must be authorized again. Presenting an
+// authorization code again before it expires revokes the connection created
+// from it in the same way, whichever client presents it (RFC 6749 section
+// 4.1.2).
 func (s *Server) Token(w http.ResponseWriter, r *http.Request) (Event, error) {
 	if s.uninitialized() {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -224,15 +228,25 @@ func (s *Server) exchange(ctx context.Context, client Client, values url.Values,
 		return nil, badRequest("invalid_grant")
 	}
 	now := s.now()
-	record, err := s.store.TakeCode(ctx, s.key("code", code), now)
+	codeKey := s.key("code", code)
+	record, revoked, err := s.store.TakeCode(ctx, codeKey, now)
+	if errors.Is(err, ErrReused) {
+		// A consumed code was presented again. The store has already deleted
+		// the connection created from it, if there was one.
+		if revoked.ID != "" {
+			event.ConnectionID, event.Subject = revoked.ID, revoked.Subject
+		}
+		return nil, &failure{status: http.StatusBadRequest, code: "invalid_grant", err: ErrReused}
+	}
 	if errors.Is(err, ErrInvalid) {
 		return nil, badRequest("invalid_grant")
 	}
 	if err != nil {
 		return nil, unavailable(fmt.Errorf("mcpoauth: take code: %w", err))
 	}
-	// The code is consumed. No failure below restores it. The store's own
-	// expiry check is repeated rather than trusted.
+	// The code is consumed. No failure below restores it, and presenting it
+	// again is reuse. The store's own expiry check is repeated rather than
+	// trusted.
 	if !now.Before(record.ExpiresAt) {
 		return nil, badRequest("invalid_grant")
 	}
@@ -262,11 +276,22 @@ func (s *Server) exchange(ctx context.Context, client Client, values url.Values,
 		CreatedAt: now, RefreshedAt: now,
 		Access: s.key("access", access), AccessExpiry: now.Add(s.accessTTL),
 		Refresh: s.key("refresh", refresh), RefreshExpiry: now.Add(s.refreshIdle),
+		Code: codeKey,
 	}
 	if s.absolute != 0 {
 		conn.AbsoluteExpiry = now.Add(s.absolute)
 	}
-	if err := s.store.Create(ctx, conn); err != nil {
+	// The store refuses the connection when the code was presented again, or
+	// its record was removed, since TakeCode.
+	err = s.store.Create(ctx, conn)
+	if errors.Is(err, ErrReused) {
+		event.Subject = record.Subject
+		return nil, &failure{status: http.StatusBadRequest, code: "invalid_grant", err: ErrReused}
+	}
+	if errors.Is(err, ErrInvalid) {
+		return nil, badRequest("invalid_grant")
+	}
+	if err != nil {
 		return nil, unavailable(fmt.Errorf("mcpoauth: create connection: %w", err))
 	}
 	event.ConnectionID, event.Subject = conn.ID, conn.Subject

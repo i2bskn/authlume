@@ -202,7 +202,8 @@ func (s *site) refresh(token string, want int) tokens {
 	return s.token(url.Values{"grant_type": {"refresh_token"}, "refresh_token": {token}}, want)
 }
 
-// mcp calls the protected endpoint and returns the challenge, if any.
+// mcp sends a bodiless request to the protected endpoint and returns the
+// challenge, if any.
 func (s *site) mcp(method, token string, want int) reply {
 	s.t.Helper()
 	var form url.Values
@@ -210,6 +211,49 @@ func (s *site) mcp(method, token string, want int) reply {
 		form = url.Values{}
 	}
 	return s.do(s.client, "/mcp", form, want, "Authorization", "Bearer "+token)
+}
+
+// rpc posts one JSON-RPC message to the MCP endpoint.
+func (s *site) rpc(token, message string, want int) reply {
+	s.t.Helper()
+	req, err := http.NewRequest(http.MethodPost, s.server.URL+"/mcp", strings.NewReader(message))
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	response, err := s.client.Do(req)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(response.Body)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	if response.StatusCode != want {
+		s.t.Fatalf("POST /mcp %s: status %d, want %d: %s", message, response.StatusCode, want, raw)
+	}
+	return reply{response, string(raw)}
+}
+
+// call runs a tool and returns the text of its result.
+func (s *site) call(token, tool string, want int) string {
+	s.t.Helper()
+	r := s.rpc(token, `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"`+tool+`","arguments":{"text":"hello"}}}`, want)
+	if want != http.StatusOK {
+		return ""
+	}
+	var got struct {
+		ID     int `json:"id"`
+		Result struct {
+			Content []struct{ Type, Text string } `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(r.body), &got); err != nil || got.ID != 7 || len(got.Result.Content) != 1 || got.Result.Content[0].Type != "text" {
+		s.t.Fatalf("tool %s reply %q: %v", tool, r.body, err)
+	}
+	return got.Result.Content[0].Text
 }
 
 func (s *site) ids(subject string) []string {
@@ -267,12 +311,14 @@ func TestConnectRefreshAndDisconnect(t *testing.T) {
 		ClientID string   `json:"client_id"`
 		Scopes   []string `json:"scopes"`
 	}
-	r = s.mcp(http.MethodGet, first.Access, http.StatusOK)
-	if err := json.Unmarshal([]byte(r.body), &described); err != nil || described.Subject != demoSubject ||
+	whoami := s.call(first.Access, "whoami", http.StatusOK)
+	if err := json.Unmarshal([]byte(whoami), &described); err != nil || described.Subject != demoSubject ||
 		described.ClientID != "demo-client" || !slices.Equal(described.Scopes, []string{"mcp:read", "mcp:write"}) {
-		t.Fatalf("mcp response %q: %v", r.body, err)
+		t.Fatalf("whoami %q: %v", whoami, err)
 	}
-	s.mcp(http.MethodPost, first.Access, http.StatusNoContent)
+	if got := s.call(first.Access, "echo", http.StatusOK); got != "hello" {
+		t.Fatalf("echo %q", got)
+	}
 
 	// After an hour the access token expires and a refresh replaces it.
 	s.clock.Add(3600)
@@ -285,7 +331,7 @@ func TestConnectRefreshAndDisconnect(t *testing.T) {
 	if second.Access == first.Access || second.Refresh == first.Refresh || second.Scope != first.Scope {
 		t.Fatalf("refreshed tokens %+v", second)
 	}
-	s.mcp(http.MethodGet, second.Access, http.StatusOK)
+	s.call(second.Access, "whoami", http.StatusOK)
 
 	// Presenting the rotated refresh token again revokes the connection.
 	if got := s.refresh(first.Refresh, http.StatusBadRequest); got.Error != "invalid_grant" {
@@ -319,13 +365,34 @@ func TestConnectRefreshAndDisconnect(t *testing.T) {
 	}
 	s.do(s.agent(true), "/connections/disconnect", url.Values{"id": {own[0]}}, http.StatusUnauthorized,
 		"Origin", s.server.URL)
-	s.mcp(http.MethodGet, third.Access, http.StatusOK)
+	s.call(third.Access, "whoami", http.StatusOK)
 	if r = s.do(s.browser, "/connections/disconnect", url.Values{"id": {own[0]}}, http.StatusSeeOther); r.Header.Get("Location") != "/connections" {
 		t.Fatalf("redirect %q", r.Header.Get("Location"))
 	}
 	s.mcp(http.MethodGet, third.Access, http.StatusUnauthorized)
 	if got := s.refresh(third.Refresh, http.StatusBadRequest); got.Error != "invalid_grant" || len(s.ids("someone-else")) != 1 {
 		t.Fatalf("refresh after disconnect %+v", got)
+	}
+}
+
+func TestCodeReplayRevokesConnection(t *testing.T) {
+	s := start(t)
+	s.login(s.browser, "")
+	code := s.consent("mcp:read", "approve").Query().Get("code")
+	exchange := func(want int) tokens {
+		t.Helper()
+		return s.token(url.Values{"grant_type": {"authorization_code"}, "code": {code}, "code_verifier": {verifier}}, want)
+	}
+	first := exchange(http.StatusOK)
+	s.call(first.Access, "whoami", http.StatusOK)
+
+	// Presenting the code again revokes the connection it created.
+	if got := exchange(http.StatusBadRequest); got.Error != "invalid_grant" || got.Access != "" {
+		t.Fatalf("second exchange %+v", got)
+	}
+	s.mcp(http.MethodGet, first.Access, http.StatusUnauthorized)
+	if got := s.refresh(first.Refresh, http.StatusBadRequest); got.Error != "invalid_grant" || len(s.ids(demoSubject)) != 0 {
+		t.Fatalf("refresh after code replay %+v, connections %v", got, s.ids(demoSubject))
 	}
 }
 
@@ -347,8 +414,8 @@ func TestConsentDecisionsAndScopes(t *testing.T) {
 	if reader.Scope != "mcp:read" {
 		t.Fatalf("default scope %q", reader.Scope)
 	}
-	s.mcp(http.MethodGet, reader.Access, http.StatusOK)
-	r := s.mcp(http.MethodPost, reader.Access, http.StatusForbidden)
+	s.call(reader.Access, "whoami", http.StatusOK)
+	r := s.rpc(reader.Access, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"text":"x"}}}`, http.StatusForbidden)
 	metadata := `resource_metadata="` + s.server.URL + `/.well-known/oauth-protected-resource/mcp"`
 	if got := r.Header.Get("WWW-Authenticate"); got != `Bearer error="insufficient_scope", `+metadata+`, scope="mcp:write"` {
 		t.Fatalf("challenge %q", got)
@@ -468,4 +535,40 @@ func TestDemoConfiguration(t *testing.T) {
 	if _, err := demo("https://127.0.0.1:8446", demoPassword, valid, store, time.Now); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestMCPProtocol(t *testing.T) {
+	s := start(t)
+	s.login(s.browser, "")
+	token := s.connect("").Access
+	for _, tt := range []struct {
+		name, message string
+		status        int
+		want          string
+	}{
+		{"initialize", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`, 200, `"protocolVersion":"2025-06-18"`},
+		{"unknown version", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}`, 200, `"protocolVersion":"2025-11-25"`},
+		{"string id", `{"jsonrpc":"2.0","id":"a","method":"ping"}`, 200, `{"id":"a","jsonrpc":"2.0","result":{}}`},
+		{"tools", `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`, 200, `"name":"whoami"`},
+		{"notification", `{"jsonrpc":"2.0","method":"notifications/initialized"}`, 202, ""},
+		{"unknown method", `{"jsonrpc":"2.0","id":3,"method":"resources/list"}`, 200, `"code":-32601`},
+		{"unknown tool", `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"rm"}}`, 200, `"code":-32602`},
+		{"not json", `hello`, 400, `"code":-32600`},
+		{"batch", `[{"jsonrpc":"2.0","id":5,"method":"ping"}]`, 400, `"code":-32600`},
+		{"wrong version", `{"jsonrpc":"1.0","id":6,"method":"ping"}`, 400, `"code":-32600`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := s.rpc(token, tt.message, tt.status)
+			if !strings.Contains(r.body, tt.want) || (tt.want == "" && r.body != "") {
+				t.Fatalf("body %q, want %q", r.body, tt.want)
+			}
+			if tt.want != "" && r.Header.Get("Content-Type") != "application/json" {
+				t.Fatalf("content type %q", r.Header.Get("Content-Type"))
+			}
+		})
+	}
+	if r := s.mcp(http.MethodGet, token, http.StatusMethodNotAllowed); r.Header.Get("Allow") != http.MethodPost {
+		t.Fatalf("allow %q", r.Header.Get("Allow"))
+	}
+	s.rpc("", `{"jsonrpc":"2.0","id":1,"method":"ping"}`, http.StatusUnauthorized)
 }

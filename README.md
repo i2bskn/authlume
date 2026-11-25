@@ -1,12 +1,14 @@
 # authlume
 
-Authlume provides independently importable packages for Go 1.25 and later. The password and server-side session packages use the standard library. The [OpenID Connect login example](examples/oidc) uses the optional `oidc` package, which depends on go-oidc and oauth2. The [WebAuthn example](examples/webauthn) uses the optional `webauthn` package, which depends on go-webauthn. The [MCP OAuth example](examples/mcp) uses the `mcpoauth` package, which depends on the standard library only.
+Authlume provides independently importable packages for Go 1.25 and later. The server-side session package uses the standard library only. The password package depends on golang.org/x/crypto for Argon2id. The [OpenID Connect login example](examples/oidc) uses the optional `oidc` package, which depends on go-oidc and oauth2. The [WebAuthn example](examples/webauthn) uses the optional `webauthn` package, which depends on go-webauthn. The [MCP OAuth example](examples/mcp) uses the `mcpoauth` package, which depends on the standard library only.
 
 ## From a password to a session
 
 Serve the login page and the rest of the browser flow over **HTTPS**. Apply **CSRF protection to every state-changing browser route**, including login before a session exists, activity updates, reauthentication, cookie recovery and logout. Register mutations as POST handlers. For Go 1.25+, the sample protects the whole router with `http.NewCrossOriginProtection().Handler(mux)` and serves that handler over TLS.
 
-Implement a `password.Lookup` function that loads an opaque subject ID and a hash created by `password.Hash`. Return `password.ErrNotFound` for an unknown identifier. The application owns password enrollment, login throttling and account policy.
+Implement a `password.Lookup` function that loads an opaque subject ID and a hash created by `auth.Hash`, the method of the configured authenticator. Return `password.ErrNotFound` for an unknown identifier. The application owns password enrollment, login throttling and account policy.
+
+New records use Argon2id by default. To use PBKDF2-HMAC-SHA256 with 600,000 iterations instead, construct the authenticator with `password.New(lookup, nil, password.WithAlgorithm(password.PBKDF2SHA256))`. The authenticator verifies only records of its configured algorithm. `password.Hash` is a convenience function that matches the default Argon2id configuration; an application that passes `WithAlgorithm` must create records with `auth.Hash`. Argon2id uses about 19 MiB per verification, including dummy work for unknown identifiers, so login throttling should also limit concurrent verifications. Return a generic error to the user for `password.ErrRecord` and alert on it internally, since it signals corrupt data or a mismatch between the configuration and stored records.
 
 ```go
 auth, err := password.New(lookup, nil) // password-only policy

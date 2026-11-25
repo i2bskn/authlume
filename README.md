@@ -25,6 +25,12 @@ In the login handler, call `auth.Authenticate(r.Context(), identifier, secret)`,
 
 After the primary method identifies a local subject, the application can verify an enrolled [TOTP code](examples/totp) or a [WebAuthn credential](examples/webauthn). The WebAuthn example covers authorized first enrollment, browser-bound verification, and issuing the regular session after both factors succeed. The application owns enrollment authorization, MFA requirements and account recovery.
 
+## Optional passkey sign-in
+
+The `webauthn` package can also sign a user in with a passkey alone, without a username. The application opts in by calling `BeginPasskeyRegistration` and `FinishPasskeyRegistration` for a recently reauthenticated subject, then `BeginPasskeyLogin` and `FinishPasskeyLogin`. These require a discoverable credential and user verification, on a platform passkey or a security key with a PIN or biometric check. A key registered as a second factor is never promoted to standalone sign-in; enroll it again as a passkey after the application deletes the old key, while another verified factor remains. A successful `FinishPasskeyLogin` returns the subject and the application decides whether to issue a session.
+
+The application owns reauthentication before adding or deleting a passkey, keeping the last usable sign-in method, the account state check before issuing a session, the decision to treat a user-verified passkey sign-in as MFA, per-client and overall limits on the unauthenticated begin, and recovery. The [WebAuthn example](examples/webauthn) shows the flow and lists these duties.
+
 ## Session policy
 
 | Setting | OSS default | Example i2 application profile |

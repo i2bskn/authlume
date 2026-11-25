@@ -1,5 +1,6 @@
 <!doctype html>
-<html lang="en"><meta charset="utf-8"><title>Authlume WebAuthn demo</title>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authlume WebAuthn demo</title>
 <h1>Sign in with a passkey or security key</h1>
 <form id="auth" method="post">
 <p><label>Username <input name="username" autocomplete="username" required></label></p>
@@ -7,10 +8,26 @@
 <p><label>Enrollment code (first registration only) <input name="code" type="password" autocomplete="off"></label></p>
 <button value="login">Sign in</button> <button value="register">Register first key</button>
 </form>
+<h2>Without a username</h2>
+<p><button type="button" id="passkey-login">Sign in with a passkey</button></p>
+<h2>After signing in</h2>
+<p><button type="button" id="passkey-add">Add a passkey</button> <button type="button" id="logout">Sign out</button></p>
 <p role="status" id="status"></p>
 <script>
 const form = document.querySelector("#auth");
 const status = document.querySelector("#status");
+// ceremony runs begin, the browser prompt and finish for one WebAuthn flow.
+async function ceremony(path, creating, body) {
+  const begin = await fetch(path + "/begin", {method: "POST", body});
+  if (!begin.ok) throw new Error(await begin.text());
+  const {publicKey} = await begin.json();
+  const credential = creating
+    ? await navigator.credentials.create({publicKey: PublicKeyCredential.parseCreationOptionsFromJSON(publicKey)})
+    : await navigator.credentials.get({publicKey: PublicKeyCredential.parseRequestOptionsFromJSON(publicKey)});
+  const finish = await fetch(path + "/finish", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify(credential.toJSON())});
+  if (!finish.ok) throw new Error(await finish.text());
+}
 form.addEventListener("submit", async event => {
   event.preventDefault();
   const action = event.submitter.value;
@@ -18,19 +35,31 @@ form.addEventListener("submit", async event => {
   const fields = new URLSearchParams(new FormData(form));
   if (!registering) fields.delete("code");
   try {
-    const begin = await fetch("/" + action + "/begin", {method: "POST", body: fields});
-    if (!begin.ok) throw new Error(await begin.text());
-    const {publicKey} = await begin.json();
-    const credential = registering
-      ? await navigator.credentials.create({publicKey: PublicKeyCredential.parseCreationOptionsFromJSON(publicKey)})
-      : await navigator.credentials.get({publicKey: PublicKeyCredential.parseRequestOptionsFromJSON(publicKey)});
-    const finish = await fetch("/" + action + "/finish", {method: "POST",
-      headers: {"Content-Type": "application/json"}, body: JSON.stringify(credential.toJSON())});
-    if (!finish.ok) throw new Error(await finish.text());
+    await ceremony("/" + action, registering, fields);
     form.reset();
     if (registering) status.textContent = "Key registered. Sign in with your password and key.";
     else location.assign("/protected");
   } catch (error) { status.textContent = error.message; }
+});
+document.querySelector("#passkey-login").addEventListener("click", async () => {
+  try {
+    await ceremony("/passkey/login", false);
+    location.assign("/protected");
+  } catch (error) {
+    status.textContent = "Passkey sign-in failed. Sign in with your username, password and key instead.";
+  }
+});
+document.querySelector("#passkey-add").addEventListener("click", async () => {
+  try {
+    await ceremony("/passkey/register", true);
+    status.textContent = "Passkey added. Sign out, then choose Sign in with a passkey.";
+  } catch (error) {
+    status.textContent = "Could not add a passkey. Sign in again, return to this page and use another authenticator.";
+  }
+});
+document.querySelector("#logout").addEventListener("click", async () => {
+  const res = await fetch("/logout", {method: "POST"});
+  status.textContent = res.ok ? "Signed out." : await res.text();
 });
 </script>
 </html>

@@ -34,7 +34,7 @@ func main() {
 	cert := flag.String("cert", "", "localhost TLS certificate")
 	key := flag.String("key", "", "localhost TLS private key")
 	flag.Parse()
-	h, err := demo(os.Getenv("AUTHLUME_PASSWORD"), os.Getenv("AUTHLUME_ENROLLMENT_CODE"), new(demoStore))
+	h, err := demo(os.Getenv("AUTHLUME_PASSWORD"), os.Getenv("AUTHLUME_ENROLLMENT_CODE"), new(demoStore), nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -54,7 +54,9 @@ type app struct {
 	attempts int
 }
 
-func demo(secret, code string, store *demoStore) (http.Handler, error) {
+// demo builds the handler. now replaces the session clock in tests; nil means
+// time.Now.
+func demo(secret, code string, store *demoStore, now func() time.Time) (http.Handler, error) {
 	hash, err := password.Hash(secret)
 	if err != nil {
 		return nil, errors.New("set AUTHLUME_PASSWORD to a demo password of 1–1024 bytes")
@@ -75,7 +77,7 @@ func demo(secret, code string, store *demoStore) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	sessions, err := session.New(session.NewMemoryStore(), session.Config{CookieName: "__Host-authlume-webauthn"})
+	sessions, err := session.New(session.NewMemoryStore(), session.Config{CookieName: "__Host-authlume-webauthn", Now: now})
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +91,22 @@ func demo(secret, code string, store *demoStore) (http.Handler, error) {
 		mux.HandleFunc("POST /"+action+"/begin", func(w http.ResponseWriter, r *http.Request) { a.begin(w, r, action) })
 		mux.HandleFunc("POST /"+action+"/finish", func(w http.ResponseWriter, r *http.Request) { a.finish(w, r, action) })
 	}
+	mux.HandleFunc("POST /passkey/register/begin", a.beginPasskeyRegistration)
+	mux.HandleFunc("POST /passkey/register/finish", a.finishPasskeyRegistration)
+	mux.HandleFunc("POST /passkey/login/begin", a.beginPasskeyLogin)
+	mux.HandleFunc("POST /passkey/login/finish", a.finishPasskeyLogin)
+	mux.HandleFunc("POST /logout", func(w http.ResponseWriter, r *http.Request) {
+		err := sessions.Logout(w, r)
+		if errors.Is(err, session.ErrInvalid) {
+			deny(w)
+			return
+		}
+		if err != nil {
+			http.Error(w, "Session unavailable.", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("GET /protected", func(w http.ResponseWriter, r *http.Request) {
 		if _, err := sessions.Read(r); err != nil {
 			deny(w)
@@ -194,6 +212,99 @@ func (a *app) finish(w http.ResponseWriter, r *http.Request, action string) {
 			http.Error(w, "Session unavailable.", http.StatusServiceUnavailable)
 			return
 		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// reauthWindow is how recently the user must have signed in to add a passkey.
+const reauthWindow = 5 * time.Minute
+
+// beginPasskeyRegistration is authorized by a fresh session, so it does not
+// consume the shared begin budget.
+func (a *app) beginPasskeyRegistration(w http.ResponseWriter, r *http.Request) {
+	state, err := a.sessions.RequireFresh(r, reauthWindow)
+	if err != nil {
+		deny(w)
+		return
+	}
+	options, handle, err := a.keys.BeginPasskeyRegistration(r.Context(), state.Subject, "demo")
+	if err != nil {
+		deny(w)
+		return
+	}
+	setFlowCookie(w, handle, 300)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(options)
+}
+
+func (a *app) finishPasskeyRegistration(w http.ResponseWriter, r *http.Request) {
+	cookies := r.CookiesNamed(flowCookie)
+	if len(cookies) != 1 {
+		deny(w)
+		return
+	}
+	setFlowCookie(w, "", -1)
+	// Recheck the session at finish. On failure the ceremony expires unused.
+	state, err := a.sessions.RequireFresh(r, reauthWindow)
+	if err != nil {
+		deny(w)
+		return
+	}
+	response, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 128<<10))
+	if err != nil {
+		deny(w)
+		return
+	}
+	// An application with several accounts checks the enrollment authorization
+	// as an Insert precondition in the same transaction.
+	subject, err := a.keys.FinishPasskeyRegistration(r.Context(), cookies[0].Value, response)
+	if err != nil || subject != state.Subject {
+		deny(w)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// beginPasskeyLogin is open to unauthenticated clients, so it consumes the
+// shared begin budget.
+func (a *app) beginPasskeyLogin(w http.ResponseWriter, r *http.Request) {
+	if !a.allow(time.Now()) {
+		http.Error(w, "Try again later.", http.StatusTooManyRequests)
+		return
+	}
+	options, handle, err := a.keys.BeginPasskeyLogin(r.Context())
+	if err != nil {
+		deny(w)
+		return
+	}
+	setFlowCookie(w, handle, 300)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(options)
+}
+
+func (a *app) finishPasskeyLogin(w http.ResponseWriter, r *http.Request) {
+	cookies := r.CookiesNamed(flowCookie)
+	if len(cookies) != 1 {
+		deny(w)
+		return
+	}
+	setFlowCookie(w, "", -1)
+	response, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 128<<10))
+	if err != nil {
+		deny(w)
+		return
+	}
+	subject, err := a.keys.FinishPasskeyLogin(r.Context(), cookies[0].Value, response)
+	if err != nil {
+		deny(w)
+		return
+	}
+	// Passkey sign-in has no first-factor step. Check here that the account is
+	// active (not suspended or locked) before issuing a session. The single
+	// demo account is always active.
+	if err := a.sessions.Issue(w, r, subject); err != nil {
+		http.Error(w, "Session unavailable.", http.StatusServiceUnavailable)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

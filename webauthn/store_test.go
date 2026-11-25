@@ -62,6 +62,25 @@ func TestMemoryCeremonyStoreRevoke(t *testing.T) {
 	}
 }
 
+func TestMemoryCeremonyStoreRevokeAnonymous(t *testing.T) {
+	s := NewMemoryCeremonyStore()
+	ctx, expires := t.Context(), time.Now().Add(time.Minute)
+	for i := range 2 {
+		if err := s.Create(ctx, testKey(i), "", []byte("login"), expires); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Passkey login ceremonies have no subject. Revoke must not sweep them.
+	if err := s.Revoke(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		if got, err := s.Take(ctx, testKey(i), time.Now()); err != nil || string(got) != "login" {
+			t.Fatal("anonymous ceremony", i, err)
+		}
+	}
+}
+
 func TestMemoryCeremonyStoreLimit(t *testing.T) {
 	s := NewMemoryCeremonyStore()
 	ctx := t.Context()

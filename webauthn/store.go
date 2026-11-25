@@ -26,10 +26,14 @@ type Key [32]byte
 // that subject; Take after deletion returns ErrInvalid. Deletion cannot stop a
 // Finish whose Take already succeeded, so also enforce recovery state in the
 // credential Store's Insert preconditions (in the same transaction).
+//
+// A passkey login ceremony is created with an empty subject, so subject-wide
+// deletion does not remove it. Revocation after Begin takes effect when Finish
+// reloads the credentials through Store.Load and when Update matches the version.
 type CeremonyStore interface {
 	// Create inserts without overwriting an existing live record. subject lets
 	// the application revoke a subject's outstanding ceremonies, for example
-	// during recovery or account suspension.
+	// during recovery or account suspension. It is empty for a passkey login.
 	Create(ctx context.Context, key Key, subject string, record []byte, expiresAt time.Time) error
 	// Take consumes a record exactly once. Return ErrInvalid for a missing or
 	// expired record (now >= expiresAt). A failed retry cannot restore a record.
@@ -44,6 +48,12 @@ type pendingCeremony struct {
 
 // MemoryCeremonyStore holds at most 4096 outstanding ceremonies in one process.
 // Use NewMemoryCeremonyStore to construct it.
+//
+// The limit is shared by every ceremony. Unlimited unauthenticated
+// BeginPasskeyLogin calls fill it: ceremonies live for five minutes, so about
+// 14 begins per second reach 4096 and second-factor begins then fail too.
+// Limit such begins per client and overall. The application also owns the
+// capacity design of a shared store.
 type MemoryCeremonyStore struct {
 	mu      sync.Mutex
 	pending map[Key]pendingCeremony
@@ -86,8 +96,12 @@ func (s *MemoryCeremonyStore) Take(_ context.Context, key Key, now time.Time) ([
 	return c.record, nil
 }
 
-// Revoke deletes every outstanding ceremony of subject.
+// Revoke deletes every outstanding ceremony of subject. An empty subject
+// deletes nothing, which keeps the anonymous passkey login ceremonies.
 func (s *MemoryCeremonyStore) Revoke(_ context.Context, subject string) error {
+	if subject == "" {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for k, c := range s.pending {

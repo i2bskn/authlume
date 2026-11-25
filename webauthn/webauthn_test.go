@@ -19,6 +19,10 @@ const (
 	testOrigin = "https://auth.example"
 	testRPID   = "auth.example"
 	present    = byte(protocol.FlagUserPresent)
+	// verified is a security key with a PIN or biometric check. synced adds the
+	// backup flags of a synced passkey.
+	verified = present | byte(protocol.FlagUserVerified)
+	synced   = verified | byte(protocol.FlagBackupEligible) | byte(protocol.FlagBackupState)
 )
 
 type storedKey struct {
@@ -31,7 +35,9 @@ type testStore struct {
 	mu            sync.Mutex
 	keys          map[string]storedKey
 	fail          error
+	loadErr       error
 	ignoreVersion bool
+	loads         int
 	updates       int
 }
 
@@ -40,6 +46,10 @@ func newTestStore() *testStore { return &testStore{keys: map[string]storedKey{}}
 func (s *testStore) Load(_ context.Context, subject string) ([]Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.loads++
+	if s.loadErr != nil {
+		return nil, s.loadErr
+	}
 	var records []Record
 	for _, k := range s.keys {
 		if k.subject == subject {
@@ -48,7 +58,7 @@ func (s *testStore) Load(_ context.Context, subject string) ([]Record, error) {
 	}
 	return records, nil
 }
-func (s *testStore) Insert(_ context.Context, subject string, key Credential) error {
+func (s *testStore) Insert(_ context.Context, subject string, key Credential, passkey bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fail != nil {
@@ -57,7 +67,7 @@ func (s *testStore) Insert(_ context.Context, subject string, key Credential) er
 	if _, ok := s.keys[string(key.ID)]; ok {
 		return ErrInvalid
 	}
-	s.keys[string(key.ID)] = storedKey{subject, Record{key, rand.Text()}}
+	s.keys[string(key.ID)] = storedKey{subject, Record{key, rand.Text(), passkey}}
 	return nil
 }
 func (s *testStore) Update(_ context.Context, subject, version string, key Credential) error {
@@ -70,7 +80,7 @@ func (s *testStore) Update(_ context.Context, subject, version string, key Crede
 	if !ok || old.subject != subject || (!s.ignoreVersion && old.record.Version != version) {
 		return ErrInvalid
 	}
-	s.keys[string(key.ID)] = storedKey{subject, Record{key, rand.Text()}}
+	s.keys[string(key.ID)] = storedKey{subject, Record{key, rand.Text(), old.record.Passkey}}
 	s.updates++
 	return nil
 }
@@ -607,8 +617,8 @@ type fixedStore struct {
 	err     error
 }
 
-func (s fixedStore) Load(context.Context, string) ([]Record, error) { return s.records, s.err }
-func (fixedStore) Insert(context.Context, string, Credential) error { return ErrInvalid }
+func (s fixedStore) Load(context.Context, string) ([]Record, error)       { return s.records, s.err }
+func (fixedStore) Insert(context.Context, string, Credential, bool) error { return ErrInvalid }
 func (fixedStore) Update(context.Context, string, string, Credential) error {
 	return ErrInvalid
 }
@@ -706,5 +716,470 @@ func TestConfigurationAndSubject(t *testing.T) {
 	}
 	if _, _, err := v.BeginRegistration(t.Context(), "alice", ""); !errors.Is(err, ErrInvalid) {
 		t.Fatal("accepted empty name")
+	}
+}
+
+// beginPasskeyRegistration returns the challenge and handle of a new passkey registration.
+func beginPasskeyRegistration(t *testing.T, v *Verifier, subject string) (string, string) {
+	t.Helper()
+	options, handle, err := v.BeginPasskeyRegistration(t.Context(), subject, "Test account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return creation(t, options).Response.Challenge.String(), handle
+}
+func registerPasskey(t *testing.T, v *Verifier, k webauthntest.Key, subject string, flags byte) error {
+	t.Helper()
+	challenge, handle := beginPasskeyRegistration(t, v, subject)
+	got, err := v.FinishPasskeyRegistration(t.Context(), handle, k.Registration(t, challenge, testOrigin, testRPID, flags))
+	if err == nil && got != subject {
+		t.Fatalf("registered %q for %q", got, subject)
+	}
+	if err != nil && got != "" {
+		t.Fatalf("returned subject %q with %v", got, err)
+	}
+	return err
+}
+
+// startPasskey returns the challenge and handle of a new passkey login.
+func startPasskey(t *testing.T, v *Verifier) (string, string) {
+	t.Helper()
+	options, handle, err := v.BeginPasskeyLogin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := assertionOptions(t, options)
+	if len(a.Response.AllowedCredentials) != 0 || a.Response.UserVerification != protocol.VerificationRequired || a.Mediation != "" {
+		t.Fatalf("expected a discoverable login with user verification: %s", options)
+	}
+	return a.Response.Challenge.String(), handle
+}
+func passkeyAssertion(challenge, subject string, flags byte, count uint32) webauthntest.Assertion {
+	a := validAssertion(challenge, subject, count)
+	a.Flags = flags
+	return a
+}
+
+func TestPasskeyRegisterAndLogin(t *testing.T) {
+	for name, flags := range map[string]byte{"security key": verified, "synced passkey": synced} {
+		t.Run(name, func(t *testing.T) {
+			v, store, ceremonies, k := setup(t)
+			second := webauthntest.New(t)
+			if err := register(t, v, second, "alice"); err != nil {
+				t.Fatal(err)
+			}
+			options, _, err := v.BeginPasskeyRegistration(t.Context(), "alice", "Alice")
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := creation(t, options).Response
+			selection := c.AuthenticatorSelection
+			if selection.AuthenticatorAttachment != "" || selection.ResidentKey != protocol.ResidentKeyRequirementRequired ||
+				selection.RequireResidentKey == nil || !*selection.RequireResidentKey || selection.UserVerification != protocol.VerificationRequired {
+				t.Fatalf("expected a discoverable, user-verifying key on any authenticator: %+v", selection)
+			}
+			if len(c.CredentialExcludeList) != 1 || !bytes.Equal(c.CredentialExcludeList[0].CredentialID, second.ID) {
+				t.Fatal("missing exclusion list")
+			}
+			if rec := ceremonies.last(t); rec.Purpose != passkeyRegistration || rec.Subject != "alice" || rec.Session.UserVerification != protocol.VerificationRequired {
+				t.Fatalf("unexpected registration ceremony: %+v", rec)
+			}
+			if err := registerPasskey(t, v, k, "alice", flags); err != nil {
+				t.Fatal(err)
+			}
+			if !store.get(k.ID).Passkey || store.get(second.ID).Passkey {
+				t.Fatal("passkey marker not stored at insert")
+			}
+			if options, _, err = v.BeginPasskeyRegistration(t.Context(), "alice", "Alice"); err != nil || len(creation(t, options).Response.CredentialExcludeList) != 2 {
+				t.Fatal("exclusions must list every credential", err)
+			}
+			challenge, handle := startPasskey(t, v)
+			if rec := ceremonies.last(t); rec.Purpose != passkeyLogin || rec.Subject != "" || len(rec.Session.UserID) != 0 || len(rec.Session.AllowedCredentialIDs) != 0 {
+				t.Fatalf("unexpected login ceremony: %+v", rec)
+			}
+			subject, err := v.FinishPasskeyLogin(t.Context(), handle, k.Sign(t, passkeyAssertion(challenge, "alice", flags, 1)))
+			if err != nil || subject != "alice" {
+				t.Fatal(subject, err)
+			}
+			if r := store.get(k.ID); store.updates != 1 || !r.Passkey || r.Credential.Authenticator.SignCount != 1 {
+				t.Fatalf("got %d updates, record %+v", store.updates, r)
+			}
+			// The passkey still serves as a second factor, with or without user verification.
+			challenge, handle = start(t, v, "alice")
+			second2 := passkeyAssertion(challenge, "alice", flags&^byte(protocol.FlagUserVerified), 2)
+			if subject, err := v.FinishVerification(t.Context(), handle, k.Sign(t, second2)); err != nil || subject != "alice" {
+				t.Fatal(subject, err)
+			}
+			if !store.get(k.ID).Passkey {
+				t.Fatal("update dropped the passkey marker")
+			}
+			challenge, handle = startPasskey(t, v)
+			subject, err = v.FinishPasskeyLogin(t.Context(), handle, k.Sign(t, passkeyAssertion(challenge, "alice", flags, 2)))
+			wantFailure(t, subject, err, ErrCloned)
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatal("ErrCloned must wrap ErrInvalid")
+			}
+		})
+	}
+}
+
+func TestPasskeyNoPromotion(t *testing.T) {
+	v, store, _, second := setup(t)
+	passkey, lone := webauthntest.New(t), webauthntest.New(t)
+	if err := register(t, v, second, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := registerPasskey(t, v, passkey, "alice", verified); err != nil {
+		t.Fatal(err)
+	}
+	if err := register(t, v, lone, "bob"); err != nil {
+		t.Fatal(err)
+	}
+	// A second-factor key never signs in alone, even when it is discoverable
+	// and the user is verified.
+	for subject, k := range map[string]webauthntest.Key{"alice": second, "bob": lone} {
+		challenge, handle := startPasskey(t, v)
+		got, err := v.FinishPasskeyLogin(t.Context(), handle, k.Sign(t, passkeyAssertion(challenge, subject, verified, 1)))
+		wantFailure(t, got, err, ErrInvalid)
+	}
+	if store.updates != 0 || store.get(second.ID).Passkey {
+		t.Fatal("rejected login changed a credential")
+	}
+	challenge, handle := startPasskey(t, v)
+	if subject, err := v.FinishPasskeyLogin(t.Context(), handle, passkey.Sign(t, passkeyAssertion(challenge, "alice", verified, 1))); err != nil || subject != "alice" {
+		t.Fatal(subject, err)
+	}
+}
+
+func TestPasskeyLoginRejection(t *testing.T) {
+	v, store, _, key := setup(t)
+	if err := registerPasskey(t, v, key, "alice", verified); err != nil {
+		t.Fatal(err)
+	}
+	bob, other := webauthntest.New(t), webauthntest.New(t)
+	if err := registerPasskey(t, v, bob, "bob", verified); err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		change func(*webauthntest.Assertion, *webauthntest.Key)
+		// noLoad means the user handle must be rejected before the store sees it.
+		noLoad bool
+	}{
+		"origin path":        {change: func(a *webauthntest.Assertion, _ *webauthntest.Key) { a.Client.Origin = testOrigin + "/path" }},
+		"origin":             {change: func(a *webauthntest.Assertion, _ *webauthntest.Key) { a.Client.Origin = "https://other.example" }},
+		"challenge":          {change: func(a *webauthntest.Assertion, _ *webauthntest.Key) { a.Client.Challenge = "wrong" }},
+		"type":               {change: func(a *webauthntest.Assertion, _ *webauthntest.Key) { a.Client.Type = protocol.CreateCeremony }},
+		"rp":                 {change: func(a *webauthntest.Assertion, _ *webauthntest.Key) { a.RPID = "other.example" }},
+		"presence":           {change: func(a *webauthntest.Assertion, _ *webauthntest.Key) { a.Flags = 0 }},
+		"user verification":  {change: func(a *webauthntest.Assertion, _ *webauthntest.Key) { a.Flags = present }},
+		"backup eligibility": {change: func(a *webauthntest.Assertion, _ *webauthntest.Key) { a.Flags |= byte(protocol.FlagBackupEligible) }},
+		"signature":          {change: func(_ *webauthntest.Assertion, k *webauthntest.Key) { k.Private = other.Private }},
+		"unknown credential": {change: func(_ *webauthntest.Assertion, k *webauthntest.Key) { *k = other }},
+		"id and rawId":       {change: func(_ *webauthntest.Assertion, k *webauthntest.Key) { k.ResponseID = "Zm9v" }},
+		"empty user handle":  {change: func(a *webauthntest.Assertion, _ *webauthntest.Key) { a.UserHandle = "" }, noLoad: true},
+		"long user handle": {change: func(a *webauthntest.Assertion, _ *webauthntest.Key) {
+			a.UserHandle = strings.Repeat("x", 65)
+		}, noLoad: true},
+		"user handle encoding": {change: func(a *webauthntest.Assertion, _ *webauthntest.Key) { a.UserHandle = "alice\xff" }, noLoad: true},
+		"unknown subject":      {change: func(a *webauthntest.Assertion, _ *webauthntest.Key) { a.UserHandle = "nobody" }},
+		"another subject":      {change: func(a *webauthntest.Assertion, _ *webauthntest.Key) { a.UserHandle = "bob" }},
+		"another subject's key": {change: func(_ *webauthntest.Assertion, k *webauthntest.Key) {
+			*k = bob
+		}},
+		"empty response": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			challenge, handle := startPasskey(t, v)
+			response := []byte("{}")
+			if tc.change != nil {
+				a, k := passkeyAssertion(challenge, "alice", verified, 1), key
+				tc.change(&a, &k)
+				response = k.Sign(t, a)
+			}
+			loads := store.loads
+			subject, err := v.FinishPasskeyLogin(t.Context(), handle, response)
+			wantFailure(t, subject, err, ErrInvalid)
+			if tc.noLoad && store.loads != loads {
+				t.Fatal("invalid user handle reached the store")
+			}
+			subject, err = v.FinishPasskeyLogin(t.Context(), handle, key.Sign(t, passkeyAssertion(challenge, "alice", verified, 1)))
+			wantFailure(t, subject, err, ErrInvalid)
+		})
+	}
+	if store.updates != 0 {
+		t.Fatal("rejected login updated a credential")
+	}
+}
+
+func TestPasskeyRegistrationRejection(t *testing.T) {
+	v, store, _, key := setup(t)
+	for _, subject := range []string{"", strings.Repeat("x", 65), "alice\xff"} {
+		if _, _, err := v.BeginPasskeyRegistration(t.Context(), subject, "User"); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("accepted invalid subject %q", subject)
+		}
+	}
+	if _, _, err := v.BeginPasskeyRegistration(t.Context(), "alice", ""); !errors.Is(err, ErrInvalid) {
+		t.Fatal("accepted empty name")
+	}
+	if store.loads != 0 {
+		t.Fatalf("got %d loads: an invalid subject or name must not reach the store", store.loads)
+	}
+	for name, response := range map[string]func(challenge string) []byte{
+		"user verification": func(c string) []byte { return key.Registration(t, c, testOrigin, testRPID, present) },
+		"presence": func(c string) []byte {
+			return key.Registration(t, c, testOrigin, testRPID, byte(protocol.FlagUserVerified))
+		},
+		"backup state": func(c string) []byte {
+			return key.Registration(t, c, testOrigin, testRPID, verified|byte(protocol.FlagBackupState))
+		},
+		"origin":    func(c string) []byte { return key.Registration(t, c, testOrigin+"/path", testRPID, verified) },
+		"challenge": func(string) []byte { return key.Registration(t, "wrong", testOrigin, testRPID, verified) },
+		"rp hash":   func(c string) []byte { return key.Registration(t, c, testOrigin, "other.example", verified) },
+		"id and rawId": func(c string) []byte {
+			k := key
+			k.ResponseID, k.ResponseRawID = "Zm9v", []byte("foo")
+			return k.Registration(t, c, testOrigin, testRPID, verified)
+		},
+		"response": func(string) []byte { return []byte("{}") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			challenge, handle := beginPasskeyRegistration(t, v, "alice")
+			subject, err := v.FinishPasskeyRegistration(t.Context(), handle, response(challenge))
+			wantFailure(t, subject, err, ErrInvalid)
+			subject, err = v.FinishPasskeyRegistration(t.Context(), handle, key.Registration(t, challenge, testOrigin, testRPID, verified))
+			wantFailure(t, subject, err, ErrInvalid)
+		})
+	}
+	if len(store.keys) != 0 {
+		t.Fatal("rejected registration stored a key")
+	}
+}
+
+// Each ceremony completes only through the Finish method of its own purpose.
+// A mismatched Finish consumes it.
+func TestPasskeyPurposeMixups(t *testing.T) {
+	v, store, _, second := setup(t)
+	passkey := webauthntest.New(t)
+	if err := register(t, v, second, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := registerPasskey(t, v, passkey, "alice", verified); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("verification as passkey login", func(t *testing.T) {
+		challenge, handle := start(t, v, "alice")
+		response := passkey.Sign(t, passkeyAssertion(challenge, "alice", verified, 1))
+		subject, err := v.FinishPasskeyLogin(t.Context(), handle, response)
+		wantFailure(t, subject, err, ErrInvalid)
+		subject, err = v.FinishVerification(t.Context(), handle, response)
+		wantFailure(t, subject, err, ErrInvalid)
+	})
+	t.Run("passkey login as verification", func(t *testing.T) {
+		challenge, handle := startPasskey(t, v)
+		response := passkey.Sign(t, passkeyAssertion(challenge, "alice", verified, 1))
+		subject, err := v.FinishVerification(t.Context(), handle, response)
+		wantFailure(t, subject, err, ErrInvalid)
+		subject, err = v.FinishPasskeyLogin(t.Context(), handle, response)
+		wantFailure(t, subject, err, ErrInvalid)
+	})
+	t.Run("registration as passkey registration", func(t *testing.T) {
+		challenge, handle := beginRegistration(t, v, "alice")
+		response := webauthntest.New(t).Registration(t, challenge, testOrigin, testRPID, verified)
+		subject, err := v.FinishPasskeyRegistration(t.Context(), handle, response)
+		wantFailure(t, subject, err, ErrInvalid)
+		subject, err = v.FinishRegistration(t.Context(), handle, response)
+		wantFailure(t, subject, err, ErrInvalid)
+	})
+	t.Run("passkey registration as registration", func(t *testing.T) {
+		challenge, handle := beginPasskeyRegistration(t, v, "alice")
+		response := webauthntest.New(t).Registration(t, challenge, testOrigin, testRPID, verified)
+		subject, err := v.FinishRegistration(t.Context(), handle, response)
+		wantFailure(t, subject, err, ErrInvalid)
+		subject, err = v.FinishPasskeyRegistration(t.Context(), handle, response)
+		wantFailure(t, subject, err, ErrInvalid)
+	})
+	if len(store.keys) != 2 || store.updates != 0 {
+		t.Fatal("mismatched ceremony changed the credentials")
+	}
+}
+
+func TestPasskeyCeremonyRecord(t *testing.T) {
+	v, store, ceremonies, key := setup(t)
+	if err := registerPasskey(t, v, key, "alice", verified); err != nil {
+		t.Fatal(err)
+	}
+	offline := errors.New("ceremony store offline")
+	for name, tc := range map[string]struct {
+		mutate       func([]byte) []byte
+		takeErr      error
+		registration bool
+		want         error
+	}{
+		"json":       {mutate: func([]byte) []byte { return []byte("{") }, want: ErrRecord},
+		"format":     {mutate: edit(t, func(r *ceremonyRecord) { r.Format = 2 }), want: ErrRecord},
+		"take error": {takeErr: offline, want: offline},
+		"purpose":    {mutate: edit(t, func(r *ceremonyRecord) { r.Purpose = passkeyRegistration }), want: ErrInvalid},
+		"subject":    {mutate: edit(t, func(r *ceremonyRecord) { r.Subject = "alice" }), want: ErrInvalid},
+		"user ID":    {mutate: edit(t, func(r *ceremonyRecord) { r.Session.UserID = []byte("alice") }), want: ErrInvalid},
+		"subject and user ID": {mutate: edit(t, func(r *ceremonyRecord) {
+			r.Subject, r.Session.UserID = "alice", []byte("alice")
+		}), want: ErrInvalid},
+		"allowed credentials": {mutate: edit(t, func(r *ceremonyRecord) { r.Session.AllowedCredentialIDs = [][]byte{key.ID} }), want: ErrInvalid},
+		"verification":        {mutate: edit(t, func(r *ceremonyRecord) { r.Session.UserVerification = protocol.VerificationPreferred }), want: ErrInvalid},
+		"RP ID":               {mutate: edit(t, func(r *ceremonyRecord) { r.Session.RelyingPartyID = "other.example" }), want: ErrInvalid},
+		"expired":             {mutate: edit(t, func(r *ceremonyRecord) { r.Session.Expires = time.Now().Add(-time.Second) }), want: ErrInvalid},
+		"mediation":           {mutate: edit(t, func(r *ceremonyRecord) { r.Session.Mediation = protocol.MediationOptional }), want: ErrInvalid},
+		"extensions":          {mutate: edit(t, func(r *ceremonyRecord) { r.Session.Extensions = protocol.AuthenticationExtensions{"x": true} }), want: ErrInvalid},
+		"verification reg":    {mutate: edit(t, func(r *ceremonyRecord) { r.Session.UserVerification = protocol.VerificationPreferred }), registration: true, want: ErrInvalid},
+		"purpose reg":         {mutate: edit(t, func(r *ceremonyRecord) { r.Purpose = registration }), registration: true, want: ErrInvalid},
+		"empty subject reg":   {mutate: edit(t, func(r *ceremonyRecord) { r.Subject, r.Session.UserID = "", nil }), registration: true, want: ErrInvalid},
+		"user ID reg":         {mutate: edit(t, func(r *ceremonyRecord) { r.Session.UserID = []byte("bob") }), registration: true, want: ErrInvalid},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ceremonies.mutate, ceremonies.takeErr = tc.mutate, tc.takeErr
+			defer func() { ceremonies.mutate, ceremonies.takeErr = nil, nil }()
+			var subject string
+			var err error
+			if tc.registration {
+				challenge, handle := beginPasskeyRegistration(t, v, "carol")
+				subject, err = v.FinishPasskeyRegistration(t.Context(), handle, webauthntest.New(t).Registration(t, challenge, testOrigin, testRPID, verified))
+			} else {
+				challenge, handle := startPasskey(t, v)
+				subject, err = v.FinishPasskeyLogin(t.Context(), handle, key.Sign(t, passkeyAssertion(challenge, "alice", verified, 1)))
+			}
+			wantFailure(t, subject, err, tc.want)
+			if tc.want != ErrInvalid && errors.Is(err, ErrInvalid) {
+				t.Fatal("backend or record failure reported as ErrInvalid", err)
+			}
+		})
+	}
+	if len(store.keys) != 1 || store.updates != 0 {
+		t.Fatal("altered ceremony changed the credentials")
+	}
+}
+
+func TestPasskeyStoreFailures(t *testing.T) {
+	v, store, ceremonies, k := setup(t)
+	offline := errors.New("storage offline")
+	store.fail = offline
+	if err := registerPasskey(t, v, k, "alice", verified); !errors.Is(err, offline) || errors.Is(err, ErrInvalid) {
+		t.Fatal("insert failure", err)
+	}
+	store.fail = ErrInvalid
+	if err := registerPasskey(t, v, k, "alice", verified); !errors.Is(err, ErrInvalid) {
+		t.Fatal("insert rejection", err)
+	}
+	store.fail = nil
+	if err := registerPasskey(t, v, k, "alice", verified); err != nil {
+		t.Fatal(err)
+	}
+	for _, failure := range []string{"revocation", "load error", "update error", "update rejection", "stale version"} {
+		t.Run(failure, func(t *testing.T) {
+			saved := store.keys[string(k.ID)]
+			defer func() {
+				store.keys[string(k.ID)] = saved
+				store.fail, store.loadErr, store.ignoreVersion = nil, nil, false
+			}()
+			challenge, handle := startPasskey(t, v)
+			want := ErrInvalid
+			switch failure {
+			case "revocation":
+				// The key is deleted after Begin. Finish reloads and rejects it.
+				store.remove(k.ID)
+			case "load error":
+				store.loadErr = offline
+				want = offline
+			case "update error":
+				store.fail = offline
+				want = offline
+			case "update rejection":
+				store.fail = ErrInvalid
+			}
+			subject, err := v.FinishPasskeyLogin(t.Context(), handle, k.Sign(t, passkeyAssertion(challenge, "alice", verified, 1)))
+			if failure == "stale version" {
+				// Another login rotating the version before Finish does not matter: Finish reloads.
+				if err != nil || subject != "alice" {
+					t.Fatal(subject, err)
+				}
+				return
+			}
+			wantFailure(t, subject, err, want)
+			if want != ErrInvalid && errors.Is(err, ErrInvalid) {
+				t.Fatal("backend failure reported as ErrInvalid", err)
+			}
+		})
+	}
+	ceremonies.createErr = offline
+	options, handle, err := v.BeginPasskeyRegistration(t.Context(), "alice", "Alice")
+	if !errors.Is(err, offline) || errors.Is(err, ErrInvalid) || options != nil || handle != "" {
+		t.Fatal("registration", err)
+	}
+	options, handle, err = v.BeginPasskeyLogin(t.Context())
+	if !errors.Is(err, offline) || errors.Is(err, ErrInvalid) || options != nil || handle != "" {
+		t.Fatal("login", err)
+	}
+	ceremonies.createErr, store.loadErr = nil, offline
+	if _, _, err := v.BeginPasskeyRegistration(t.Context(), "alice", "Alice"); !errors.Is(err, offline) || errors.Is(err, ErrInvalid) {
+		t.Fatal("load", err)
+	}
+}
+
+func TestPasskeyConcurrentCompletion(t *testing.T) {
+	v, store, _, k := setup(t)
+	if err := registerPasskey(t, v, k, "alice", verified); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("one ceremony", func(t *testing.T) {
+		// Without the ceremony store, nothing else rejects the second completion.
+		store.ignoreVersion = true
+		defer func() { store.ignoreVersion = false }()
+		challenge, handle := startPasskey(t, v)
+		response := k.Sign(t, passkeyAssertion(challenge, "alice", verified, 0))
+		ready := make(chan struct{})
+		results := make(chan error, 2)
+		for range 2 {
+			go func() {
+				<-ready
+				_, err := v.FinishPasskeyLogin(context.Background(), handle, response)
+				results <- err
+			}()
+		}
+		close(ready)
+		first, second := <-results, <-results
+		if (first == nil) == (second == nil) {
+			t.Fatalf("want exactly one success: %v, %v", first, second)
+		}
+		if store.updates != 1 {
+			t.Fatalf("got %d updates", store.updates)
+		}
+	})
+	t.Run("stale version", func(t *testing.T) {
+		// The store rejects an update against a version another login replaced.
+		r := store.get(k.ID)
+		if err := store.Update(t.Context(), "alice", "stale", r.Credential); !errors.Is(err, ErrInvalid) {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestPasskeySharedStoresAndRevoke(t *testing.T) {
+	v, store, ceremonies, k := setup(t)
+	other, err := New(testOrigin, "Test", store, ceremonies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	challenge, handle := beginPasskeyRegistration(t, v, "alice")
+	if subject, err := other.FinishPasskeyRegistration(t.Context(), handle, k.Registration(t, challenge, testOrigin, testRPID, verified)); err != nil || subject != "alice" {
+		t.Fatal(subject, err)
+	}
+	challenge, handle = startPasskey(t, other)
+	// Subject-wide revocation leaves the anonymous login ceremony in place.
+	for _, subject := range []string{"alice", ""} {
+		if err := ceremonies.Revoke(t.Context(), subject); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if subject, err := v.FinishPasskeyLogin(t.Context(), handle, k.Sign(t, passkeyAssertion(challenge, "alice", verified, 1))); err != nil || subject != "alice" {
+		t.Fatal(subject, err)
 	}
 }

@@ -92,7 +92,7 @@ func TestAcceptanceWindow(t *testing.T) {
 func TestCredentialAndConsumption(t *testing.T) {
 	s := fixture()
 	v := verifier(t, s, 59)
-	for _, code := range []string{"", "28708", "2870820", " 87082", "28708a", "000000"} {
+	for _, code := range []string{"", "28708", "2870820", "287 082", " 87082", "28708a", "000000"} {
 		if err := v.Verify(t.Context(), subject, code); !errors.Is(err, totp.ErrInvalid) || s.consumes != 0 {
 			t.Fatalf("invalid code: err=%v consumes=%d", err, s.consumes)
 		}
@@ -121,6 +121,7 @@ func TestStoreErrors(t *testing.T) {
 		{"lookup", func(s *fixtureStore) { s.loadErr = unavailable }, unavailable, 0},
 		{"missing id", func(s *fixtureStore) { s.credential.ID = "" }, totp.ErrRecord, 0},
 		{"short secret", func(s *fixtureStore) { s.credential.Secret = make([]byte, 19) }, totp.ErrRecord, 0},
+		{"legacy 80-bit secret", func(s *fixtureStore) { s.credential.Secret = []byte("1234567890") }, totp.ErrRecord, 0},
 		{"rotated before consume", func(s *fixtureStore) { s.consumeErr = totp.ErrInvalid }, totp.ErrInvalid, 1},
 		{"write failure", func(s *fixtureStore) { s.consumeErr = unavailable }, unavailable, 1},
 	} {

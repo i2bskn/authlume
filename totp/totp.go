@@ -1,8 +1,10 @@
 // Package totp verifies enrolled RFC 6238 second factors for an application's
 // already authenticated subject. The profile uses six digits, HMAC-SHA-1,
-// a 30-second period and Unix epoch T0. The current and previous periods are
-// accepted to allow for entry delay. This profile requires HMAC-SHA-1 and is
-// incompatible with Go's FIPS 140-only mode. Applications own enrollment, recovery,
+// a 30-second period and Unix epoch T0. Verification checks the server's
+// current period and the preceding period to allow for entry delay. If a fast
+// device already shows the next period, that step is eligible only when the
+// server reaches it. This profile requires HMAC-SHA-1 and is incompatible
+// with Go's FIPS 140-only mode. Applications own enrollment, recovery,
 // throttling and the decision to require this factor.
 package totp
 
@@ -26,7 +28,9 @@ var (
 
 // Credential is a consistent snapshot of an active enrollment. Each activation
 // needs a fresh random secret of at least 20 bytes and a never-reused ID.
-// Secret contains decoded bytes. Its backing array must remain immutable.
+// Secret contains decoded bytes and its backing array must remain immutable.
+// Verify returns ErrRecord for shorter secrets, including legacy 10-byte
+// enrollments.
 type Credential struct {
 	ID     string
 	Secret []byte
@@ -62,7 +66,8 @@ func New(store Store, now func() time.Time) (*Verifier, error) {
 }
 
 // Verify completes the TOTP check for subject, as established by successful
-// primary authentication. Only nil means success. Callers must limit attempts
+// primary authentication. The code must be exactly six ASCII digits, including
+// any leading zeros. Only nil means success. Callers must limit attempts
 // across logins and may issue a session only after all policy checks succeed.
 // A later session issuance failure does not undo consumption.
 func (v *Verifier) Verify(ctx context.Context, subject, code string) error {

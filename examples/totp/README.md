@@ -23,7 +23,13 @@ Import the value of `AUTHLUME_TOTP_SECRET` into your authenticator using manual 
 go run ./examples/totp -require-mfa -cert "$certdir/cert.pem" -key "$certdir/key.pem"
 ```
 
-Open <https://127.0.0.1:8444/> with the temporary certificate trusted for this demo. Wait for the first new authenticator code after server startup, then sign in as `demo`. The server allows five submissions per minute across this single demo account. The code for the current or immediately preceding period can succeed once. A new login needs a newer code. The sample holds replay state in one process and excludes the startup period and earlier periods on each start, assuming a clock that stays synchronized across restarts.
+Open <https://127.0.0.1:8444/> with the temporary certificate trusted for this demo. Wait for the first new authenticator code after server startup, then sign in as `demo`. The form accepts six digits as `012345` or `012 345` with one ordinary space between the groups. Keep any leading zero. The server allows five submissions per minute across this single demo account.
+
+Authlume checks the server's current 30-second step and the immediately preceding step. The matched step must be newer than the last one consumed for that enrollment. If a device clock is ahead but still in the same step, its code can succeed. If the device already shows the next step, the server will first check that step when it begins. Keep the device and server clocks synchronized. The sample holds replay state in one process and excludes the startup step and earlier steps after each restart.
+
+## Migrating an existing enrollment
+
+Authlume requires at least 20 decoded bytes per TOTP secret. A legacy 16-character Base32 secret decodes to 10 bytes (80 bits), so verification returns `totp.ErrRecord` for that enrollment. Before switching the account to Authlume, use the application's verified enrollment or recovery flow to register and confirm a fresh random secret of at least 20 bytes with the user's authenticator.
 
 ## Use TOTP with another primary method
 

@@ -148,7 +148,12 @@ func handler(auth *password.Authenticator, verifier *totp.Verifier, sessions *se
 		if err == nil {
 			switch result.Decision {
 			case password.RequireMFA:
-				err = verifier.Verify(r.Context(), result.Subject, r.PostForm.Get("code"))
+				code := r.PostForm.Get("code")
+				// Some authenticators display two groups of three digits.
+				if len(code) == 7 && code[3] == ' ' {
+					code = code[:3] + code[4:]
+				}
+				err = verifier.Verify(r.Context(), result.Subject, code)
 			case password.PasswordOnly:
 				// The application policy is already complete.
 			default:

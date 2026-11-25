@@ -70,17 +70,19 @@ func protected(t *testing.T, client *http.Client, server *httptest.Server, want 
 func TestHTTPSLogin(t *testing.T) {
 	server, clock := app(t, true)
 	client := browser(t, server)
-	// Use a future RFC vector so the real browser jar retains the test cookie.
-	clock.Store(20000000000)
+	// At this future step the fixture code begins with zero and the
+	// real cookie jar retains the resulting session cookie.
+	clock.Store(20000000370)
 	login(t, client, server, credentials(""), http.StatusUnauthorized)
 	protected(t, client, server, http.StatusUnauthorized)
-	input := credentials("353130")
+	input := credentials("092148")
 	input.Set("password", "incorrect")
 	login(t, client, server, input, http.StatusUnauthorized)
-	login(t, client, server, credentials("353130"), http.StatusSeeOther)
+	login(t, client, server, credentials("09 2148"), http.StatusUnauthorized)
+	login(t, client, server, credentials("092 148"), http.StatusSeeOther)
 	protected(t, client, server, http.StatusOK)
 	other := browser(t, server)
-	login(t, other, server, credentials("353130"), http.StatusUnauthorized)
+	login(t, other, server, credentials("092148"), http.StatusUnauthorized)
 	protected(t, other, server, http.StatusUnauthorized)
 }
 

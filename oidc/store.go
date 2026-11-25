@@ -23,6 +23,9 @@ type Transaction struct {
 	Nonce     string
 	Verifier  string
 	ExpiresAt time.Time
+	StartedAt time.Time
+	// MaxAgeSeconds is the requested freshness constraint. Persist nil distinctly from zero.
+	MaxAgeSeconds *int64
 }
 
 // Store operations on a key must be atomic, including across processes. Arrange
@@ -42,6 +45,7 @@ type MemoryStore struct {
 	pending map[Key]Transaction
 }
 
+// NewMemoryStore returns an empty, bounded single-process transaction store.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{pending: make(map[Key]Transaction)}
 }

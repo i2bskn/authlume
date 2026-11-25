@@ -1,6 +1,6 @@
 # authlume
 
-Authlume provides password authentication and server-side Web sessions for Go 1.25 and later. Both packages use the standard library. Use either package independently or connect them in an application handler.
+Authlume provides independently importable packages for Go 1.25 and later. The password and server-side session packages use the standard library. The [OpenID Connect login example](examples/oidc) uses the optional `oidc` package, which depends on go-oidc and oauth2.
 
 ## From a password to a session
 

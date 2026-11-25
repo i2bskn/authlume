@@ -32,6 +32,7 @@ type Assurance struct {
 	AuthTime time.Time
 }
 
+// Identity contains a verified external identifier and the provider’s signed assurance.
 type Identity struct {
 	ID        ExternalID
 	Assurance Assurance
@@ -46,10 +47,11 @@ type Config struct {
 	Transport                                   http.RoundTripper
 }
 
+// Client manages browser logins for one configured issuer and client registration.
 type Client struct {
 	issuer                string
 	oauth                 oauth2.Config
-	verify                *provider.IDTokenVerifier
+	keys                  provider.KeySet
 	http                  *http.Client
 	store                 Store
 	cookieName            string
@@ -68,13 +70,20 @@ func New(ctx context.Context, cfg Config, store Store) (*Client, error) {
 		cfg.ClientID == "" || cfg.ClientSecret == "" {
 		return nil, errors.New("oidc: invalid client configuration")
 	}
+	transport := cfg.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
 	hc := &http.Client{
-		Timeout: 10 * time.Second, Transport: cfg.Transport,
+		Timeout: 10 * time.Second, Transport: providerTransport{base: transport},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	p, err := provider.NewProvider(provider.ClientContext(ctx, hc), cfg.Issuer)
 	if err != nil {
-		return nil, errors.New("oidc: provider discovery failed")
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, ErrProviderUnavailable
 	}
 	var meta struct {
 		provider.ProviderConfig
@@ -95,7 +104,8 @@ func New(ctx context.Context, cfg Config, store Store) (*Client, error) {
 			ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret, RedirectURL: cfg.RedirectURL,
 			Endpoint: endpoint, Scopes: []string{provider.ScopeOpenID},
 		},
-		verify: p.Verifier(&provider.Config{ClientID: cfg.ClientID, SupportedSigningAlgs: []string{provider.RS256}}),
+		// Discovery honors ctx; the shared key cache outlives initialization.
+		keys: provider.NewRemoteKeySet(provider.ClientContext(context.Background(), hc), meta.JWKSURL),
 	}, nil
 }
 
@@ -134,16 +144,31 @@ func privateResponse(w http.ResponseWriter) {
 // Begin starts a login and sends a 303. Mount on a CSRF-protected POST route
 // served over HTTPS. Starting again supersedes the prior browser attempt.
 func (c *Client) Begin(w http.ResponseWriter, r *http.Request) error {
+	return c.BeginWithOptions(w, r, AuthorizationOptions{})
+}
+
+// BeginWithOptions starts a login with application-selected authorization parameters.
+func (c *Client) BeginWithOptions(w http.ResponseWriter, r *http.Request, options AuthorizationOptions) error {
 	privateResponse(w)
 	if r.Method != http.MethodPost {
 		return ErrInvalid
 	}
+	params, err := options.parameters()
+	if err != nil {
+		return err
+	}
+	now := time.Now()
 	state, browser := randomValue(), randomValue()
-	tx := Transaction{Nonce: randomValue(), Verifier: oauth2.GenerateVerifier(), ExpiresAt: time.Now().Add(lifetime)}
+	tx := Transaction{Nonce: randomValue(), Verifier: oauth2.GenerateVerifier(), StartedAt: now, ExpiresAt: now.Add(lifetime)}
+	if options.MaxAgeSeconds != nil {
+		age := *options.MaxAgeSeconds
+		tx.MaxAgeSeconds = &age
+	}
 	if err := c.store.Create(r.Context(), c.key(state, browser), tx); err != nil {
 		return err
 	}
-	dest := c.oauth.AuthCodeURL(state, provider.Nonce(tx.Nonce), oauth2.S256ChallengeOption(tx.Verifier))
+	params = append(params, provider.Nonce(tx.Nonce), oauth2.S256ChallengeOption(tx.Verifier))
+	dest := c.oauth.AuthCodeURL(state, params...)
 	http.SetCookie(w, c.cookie(browser, int(lifetime.Seconds())))
 	http.Redirect(w, r, dest, http.StatusSeeOther)
 	return nil
@@ -178,6 +203,8 @@ func (c *Client) Complete(w http.ResponseWriter, r *http.Request) (Identity, err
 	if r.Method != http.MethodGet || err != nil || !ok || len(q["state"]) != 1 || !validValue(q.Get("state")) {
 		return Identity{}, ErrInvalid
 	}
+	// An unmatched or unavailable store may still hold the current browser's
+	// pending login. Only clear the cookie after a confirmed consumption.
 	tx, err := c.store.Take(r.Context(), c.key(q.Get("state"), browser), time.Now())
 	if err != nil {
 		return Identity{}, err
@@ -191,14 +218,19 @@ func (c *Client) Complete(w http.ResponseWriter, r *http.Request) (Identity, err
 	ctx := provider.ClientContext(r.Context(), c.http)
 	t, err := c.oauth.Exchange(ctx, q.Get("code"), oauth2.VerifierOption(tx.Verifier))
 	if err != nil {
-		return Identity{}, ErrInvalid
+		return Identity{}, exchangeError(ctx, err)
 	}
 	raw, _ := t.Extra("id_token").(string)
-	id, err := c.verify.Verify(ctx, raw)
+	id, err := c.verifyToken(ctx, raw)
 	if err != nil {
+		return Identity{}, err
+	}
+	now := time.Now()
+	identity, err := c.identity(id, tx.Nonce, now)
+	if err != nil || !tx.acceptsAuthTime(identity.Assurance.AuthTime, now) {
 		return Identity{}, ErrInvalid
 	}
-	return c.identity(id, tx.Nonce, time.Now())
+	return identity, nil
 }
 
 // Go struct unmarshalling folds case. Read the exact JWT claim names from the

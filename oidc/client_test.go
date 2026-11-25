@@ -163,3 +163,79 @@ func TestMalformedMatchedCallback(t *testing.T) {
 		}
 	}
 }
+
+func TestAuthorizationOptions(t *testing.T) {
+	age := int64(0)
+	store := NewMemoryStore()
+	c := &Client{oauth: oauth2.Config{Endpoint: oauth2.Endpoint{AuthURL: "https://id.example/authorize"}}, store: store, cookieName: "__Host-test"}
+	w := httptest.NewRecorder()
+	o := AuthorizationOptions{MaxAgeSeconds: &age, ACRValues: []string{"urn:example:strong", "urn:example:other"}, Prompt: "login"}
+	if err := c.BeginWithOptions(w, httptest.NewRequest("POST", "https://app.example/login", nil), o); err != nil {
+		t.Fatal(err)
+	}
+	loc, err := w.Result().Location()
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := loc.Query()
+	if q.Get("max_age") != "0" || q.Get("prompt") != "login" || q.Get("acr_values") != "urn:example:strong urn:example:other" {
+		t.Fatal("requested options not present")
+	}
+	age = 120
+	tx, err := store.Take(t.Context(), c.key(q.Get("state"), w.Result().Cookies()[0].Value), time.Now())
+	if err != nil || tx.MaxAgeSeconds == nil || *tx.MaxAgeSeconds != 0 || tx.StartedAt.IsZero() {
+		t.Fatal("freshness requirement was not snapshotted")
+	}
+
+	negative := int64(-1)
+	for _, bad := range []AuthorizationOptions{{MaxAgeSeconds: &negative}, {Prompt: "unsupported"}, {ACRValues: []string{"two words"}}, {ACRValues: []string{""}}} {
+		w = httptest.NewRecorder()
+		if err := c.BeginWithOptions(w, httptest.NewRequest("POST", "https://app.example/login", nil), bad); err == nil || len(store.pending) != 0 || len(w.Result().Cookies()) != 0 {
+			t.Fatal("invalid option started a login")
+		}
+	}
+}
+
+func TestRequestedFreshness(t *testing.T) {
+	start := time.Unix(1000, 500000000)
+	now := start.Add(10 * time.Second)
+	zero, five := int64(0), int64(5)
+	for _, tc := range []struct {
+		name string
+		max  *int64
+		at   time.Time
+		want bool
+	}{
+		{"unrequested", nil, time.Time{}, true},
+		{"missing", &five, time.Time{}, false},
+		{"zero before start", &zero, time.Unix(999, 0), false},
+		{"zero at start second", &zero, time.Unix(1000, 0), true},
+		{"zero after start", &zero, time.Unix(1002, 0), true},
+		{"positive exact age", &five, time.Unix(1005, 0), true},
+		{"stale", &five, time.Unix(1004, 0), false},
+		{"future", &five, time.Unix(1011, 0), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tx := Transaction{StartedAt: start, MaxAgeSeconds: tc.max}
+			if tx.acceptsAuthTime(tc.at, now) != tc.want {
+				t.Fatal("unexpected freshness decision")
+			}
+		})
+	}
+}
+
+func TestCanceledCallback(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	s := NewMemoryStore()
+	c := &Client{store: s, cookieName: "__Host-test", http: http.DefaultClient, oauth: oauth2.Config{Endpoint: oauth2.Endpoint{TokenURL: "https://id.example/token", AuthStyle: oauth2.AuthStyleInHeader}}}
+	state, browser := randomValue(), randomValue()
+	if err := s.Create(t.Context(), c.key(state, browser), Transaction{ExpiresAt: time.Now().Add(time.Minute), Nonce: randomValue(), Verifier: randomValue()}); err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequestWithContext(ctx, "GET", "https://app.example/callback?state="+state+"&code=sample", nil)
+	r.AddCookie(c.cookie(browser, 60))
+	if _, err := c.Complete(httptest.NewRecorder(), r); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v", err)
+	}
+}

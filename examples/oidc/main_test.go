@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +31,11 @@ type flowCase struct {
 	claims              map[string]any
 	differentSigningKey bool
 	omitResponseIssuer  bool
+	rotateTo            *rsa.PrivateKey
+	tokenError          string
+	keyStatus           int
+	keyBodyIncomplete   bool
+	resetCookie         bool
 	want                int
 }
 
@@ -47,14 +53,20 @@ func TestHTTPSLogin(t *testing.T) {
 		{name: "approved pair and OIDC-only policy", want: 200},
 		{name: "unknown subject with same verified email", claims: map[string]any{"sub": "other"}, want: 403},
 		{name: "MFA required with signed MFA claims and no app acceptance", requireMFA: true, claims: map[string]any{"amr": []string{"mfa"}, "acr": localACR, "auth_time": now}, want: 403},
-		{name: "MFA required with explicit fresh assurance", requireMFA: true, acceptACR: localACR, claims: map[string]any{"acr": localACR, "auth_time": now}, want: 200},
-		{name: "MFA required with stale assurance", requireMFA: true, acceptACR: localACR, claims: map[string]any{"acr": localACR, "auth_time": now - 600}, want: 403},
-		{name: "MFA required with absent authentication time", requireMFA: true, acceptACR: localACR, claims: map[string]any{"acr": localACR}, want: 403},
+		{name: "MFA required with explicit fresh assurance", requireMFA: true, acceptACR: localACR, claims: map[string]any{"acr": localACR}, want: 200},
+		{name: "MFA required with stale assurance", requireMFA: true, acceptACR: localACR, claims: map[string]any{"acr": localACR, "auth_time": now - 600}, want: 401},
+		{name: "MFA required with absent authentication time", requireMFA: true, acceptACR: localACR, claims: map[string]any{"acr": localACR, "auth_time": nil}, want: 401},
 		{name: "MFA required with different assurance", requireMFA: true, acceptACR: localACR, claims: map[string]any{"acr": "other", "auth_time": now}, want: 403},
 		{name: "provider-specific assurance name", requireMFA: true, acceptACR: localACR, claims: map[string]any{"ACR": localACR, "auth_time": now}, want: 403},
 		{name: "missing exact subject name", claims: map[string]any{"sub": nil, "SUB": "approved"}, want: 401},
 		{name: "explicit null authorized party", claims: map[string]any{"azp": json.RawMessage("null")}, want: 401},
 		{name: "missing advertised callback issuer", omitResponseIssuer: true, want: 401},
+		{name: "key rotation after startup cancellation", rotateTo: otherKey, want: 200},
+		{name: "token endpoint unavailable", tokenError: "server_error", want: 503},
+		{name: "invalid authorization grant", tokenError: "invalid_grant", want: 401},
+		{name: "incomplete key service response", keyBodyIncomplete: true, want: 503},
+		{name: "keys unavailable", keyStatus: 503, want: 503},
+		{name: "session cookie recovery", resetCookie: true, want: 409},
 		{name: "different issuer", claims: map[string]any{"iss": "https://different.example"}, want: 401},
 		{name: "empty subject", claims: map[string]any{"sub": ""}, want: 401},
 		{name: "different audience", claims: map[string]any{"aud": "another-client"}, want: 401},
@@ -83,9 +95,19 @@ type authorization struct{ challenge, nonce string }
 // executable. The issuer and RP use different HTTPS hostnames and a cookie jar.
 func testHTTPSFlow(t *testing.T, tc flowCase, signingKey *rsa.PrivateKey, publicKey *rsa.PublicKey) {
 	t.Helper()
-	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: signingKey}, nil)
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: signingKey}, (&jose.SignerOptions{}).WithHeader("kid", "first"))
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	var rotated atomic.Bool
+	var keyFetches atomic.Int32
+	var nextSigner jose.Signer
+	if tc.rotateTo != nil {
+		nextSigner, err = jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: tc.rotateTo}, (&jose.SignerOptions{}).WithHeader("kid", "second"))
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Start the listener first so its registered redirect URI is fixed before discovery.
@@ -104,7 +126,21 @@ func testHTTPSFlow(t *testing.T, tc flowCase, signingKey *rsa.PrivateKey, public
 			"token_endpoint": issuer + "/token", "jwks_uri": issuer + "/keys", "id_token_signing_alg_values_supported": []string{"RS256"}})
 	})
 	idpMux.HandleFunc("GET /keys", func(w http.ResponseWriter, _ *http.Request) {
-		json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: publicKey, Use: "sig", Algorithm: "RS256"}}})
+		keyFetches.Add(1)
+		if tc.keyBodyIncomplete {
+			w.Header().Set("Content-Length", "100")
+			io.WriteString(w, "{}")
+			return
+		}
+		if tc.keyStatus != 0 {
+			http.Error(w, "key service unavailable", tc.keyStatus)
+			return
+		}
+		key, kid := publicKey, "first"
+		if rotated.Load() {
+			key, kid = &tc.rotateTo.PublicKey, "second"
+		}
+		json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: key, KeyID: kid, Use: "sig", Algorithm: "RS256"}}})
 	})
 	idpMux.HandleFunc("GET /authorize", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -114,6 +150,13 @@ func testHTTPSFlow(t *testing.T, tc flowCase, signingKey *rsa.PrivateKey, public
 			t.Error("unexpected authorization request")
 			http.Error(w, "invalid request", 400)
 			return
+		}
+		if tc.requireMFA && tc.acceptACR != "" {
+			if q.Get("max_age") != "300" || q.Get("acr_values") != tc.acceptACR {
+				t.Error("missing requested provider assurance")
+			}
+		} else if q.Has("max_age") || q.Has("acr_values") || q.Has("prompt") {
+			t.Error("unexpected authorization policy parameters")
 		}
 		pending <- authorization{q.Get("code_challenge"), q.Get("nonce")}
 		values := url.Values{"code": {"test-code"}, "state": {q.Get("state")}, "iss": {issuer}}
@@ -138,9 +181,22 @@ func testHTTPSFlow(t *testing.T, tc flowCase, signingKey *rsa.PrivateKey, public
 			http.Error(w, "invalid request", 400)
 			return
 		}
+		if tc.tokenError != "" {
+			status := http.StatusServiceUnavailable
+			if tc.tokenError == "invalid_grant" {
+				status = http.StatusBadRequest
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(map[string]string{"error": tc.tokenError})
+			return
+		}
 		now := time.Now()
 		claims := map[string]any{"iss": issuer, "sub": "approved", "aud": "app", "azp": "app", "exp": now.Add(time.Hour).Unix(),
 			"iat": now.Unix(), "nonce": auth.nonce, "email": "member@example.com", "email_verified": true}
+		if tc.requireMFA && tc.acceptACR != "" {
+			claims["auth_time"] = now.Unix()
+		}
 		for k, v := range tc.claims {
 			if v == nil {
 				delete(claims, k)
@@ -153,7 +209,11 @@ func testHTTPSFlow(t *testing.T, tc flowCase, signingKey *rsa.PrivateKey, public
 			t.Error(err)
 			return
 		}
-		sig, err := signer.Sign(payload)
+		activeSigner := signer
+		if rotated.Load() {
+			activeSigner = nextSigner
+		}
+		sig, err := activeSigner.Sign(payload)
 		if err != nil {
 			t.Error(err)
 			return
@@ -176,10 +236,12 @@ func testHTTPSFlow(t *testing.T, tc flowCase, signingKey *rsa.PrivateKey, public
 		}
 		return dialer.DialContext(ctx, network, addr)
 	}
-	client, err := oidc.New(t.Context(), oidc.Config{Issuer: issuer, ClientID: "app", ClientSecret: "test-secret", RedirectURL: callback, Transport: transport}, oidc.NewMemoryStore())
+	startup, cancelStartup := context.WithCancel(t.Context())
+	client, err := oidc.New(startup, oidc.Config{Issuer: issuer, ClientID: "app", ClientSecret: "test-secret", RedirectURL: callback, Transport: transport}, oidc.NewMemoryStore())
 	if err != nil {
 		t.Fatal(err)
 	}
+	cancelStartup()
 	sessions, err := session.New(session.NewMemoryStore(), session.Config{})
 	if err != nil {
 		t.Fatal(err)
@@ -216,6 +278,13 @@ func testHTTPSFlow(t *testing.T, tc flowCase, signingKey *rsa.PrivateKey, public
 	if err != nil || !strings.Contains(string(page), `action="/login"`) {
 		t.Fatal("missing sign-in form")
 	}
+	if tc.resetCookie {
+		appURL, err := url.Parse(app.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jar.SetCookies(appURL, []*http.Cookie{{Name: session.CookieName, Value: "old-format", Path: "/", Secure: true}})
+	}
 	resp, err = browser.PostForm(app.URL+"/login", url.Values{})
 	if err != nil {
 		t.Fatal(err)
@@ -245,6 +314,39 @@ func testHTTPSFlow(t *testing.T, tc flowCase, signingKey *rsa.PrivateKey, public
 		t.Fatal("incomplete login issued a session")
 	}
 
+	if tc.rotateTo != nil || tc.resetCookie {
+		if tc.rotateTo != nil {
+			if keyFetches.Load() != 1 {
+				t.Fatal("expected first signing key to have been fetched")
+			}
+			rotated.Store(true)
+		} else {
+			if !strings.Contains(string(body), `action="/reset-cookie"`) {
+				t.Fatal("missing recovery form")
+			}
+			reset, err := browser.PostForm(app.URL+"/reset-cookie", url.Values{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			reset.Body.Close()
+			if reset.StatusCode != 200 || reset.Request.URL.Path != "/" {
+				t.Fatal("reset did not return to sign-in")
+			}
+		}
+		second, err := browser.PostForm(app.URL+"/login", url.Values{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		account, err := io.ReadAll(second.Body)
+		second.Body.Close()
+		if err != nil || second.StatusCode != 200 || second.Request.URL.Path != "/account" || string(account) != "local-account-7\n" {
+			t.Fatal("second complete login did not issue expected session")
+		}
+		if tc.rotateTo != nil && keyFetches.Load() != 2 {
+			t.Fatal("expected rotated signing key to be fetched")
+		}
+	}
+
 	retry, err := http.NewRequest("GET", callbackURL, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -257,5 +359,34 @@ func testHTTPSFlow(t *testing.T, tc flowCase, signingKey *rsa.PrivateKey, public
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatal("consumed callback accepted")
+	}
+}
+
+func TestStartBudget(t *testing.T) {
+	var b startBudget
+	now := time.Unix(100, 0)
+	for range 5 {
+		if wait := b.retryAfter(now); wait != 0 {
+			t.Fatal("start within budget was declined")
+		}
+	}
+	if wait := b.retryAfter(now.Add(59200 * time.Millisecond)); wait != 1 {
+		t.Fatalf("retry seconds %d", wait)
+	}
+	if wait := b.retryAfter(now.Add(time.Minute)); wait != 0 {
+		t.Fatal("new window did not reopen")
+	}
+
+	// A single start at the policy boundary never reaches the transaction store.
+	b = startBudget{used: 5, reset: time.Now().Add(60 * time.Second)}
+	s := httptest.NewTLSServer(b.limit(func(http.ResponseWriter, *http.Request) { t.Error("unexpected login start") }))
+	defer s.Close()
+	resp, err := s.Client().PostForm(s.URL, url.Values{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests || resp.Header.Get("Retry-After") == "" || len(resp.Cookies()) != 0 {
+		t.Fatal("missing start-limit response")
 	}
 }

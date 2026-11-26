@@ -1,6 +1,6 @@
 # Sign in with OpenID Connect
 
-This HTTPS example links one operator-approved external identity to a local account. To run it, register a confidential web client with the exact callback `https://127.0.0.1:8443/callback`. Use a provider on a separate trusted HTTPS host that supports discovery, RS256 ID tokens, the authorization code flow, client_secret_basic and S256 PKCE.
+This HTTPS example links one operator-approved external identity to a local account. To run it, register a confidential web client with the exact callback `https://127.0.0.1:8443/callback`. Use a provider on a separate trusted HTTPS host that supports discovery, RS256 ID tokens, the authorization code flow, client_secret_basic and S256 PKCE. RS256 is the default. Set `oidc.Config.SigningAlgs` to choose among RS256, PS256, ES256 and EdDSA; an ID token signed with an algorithm left off the list is rejected.
 
 The client accepts ID tokens with one audience (the registered client ID) and integer Unix timestamps. If discovery advertises an authorization response issuer parameter, the callback must include it.
 

@@ -72,8 +72,12 @@ func (k *verificationKeys) VerifySignature(ctx context.Context, raw string) ([]b
 
 func (c *Client) verifyToken(ctx context.Context, raw string) (*provider.IDToken, error) {
 	keys := &verificationKeys{keys: c.keys}
+	algs := c.algs
+	if len(algs) == 0 {
+		algs = []string{provider.RS256}
+	}
 	v := provider.NewVerifier(c.issuer, keys, &provider.Config{
-		ClientID: c.oauth.ClientID, SupportedSigningAlgs: []string{provider.RS256},
+		ClientID: c.oauth.ClientID, SupportedSigningAlgs: algs,
 	})
 	token, err := v.Verify(ctx, raw)
 	if ctx.Err() != nil {

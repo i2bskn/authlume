@@ -40,11 +40,47 @@ type Identity struct {
 
 // Config is trusted application configuration for one confidential client.
 // RedirectURL must be a dedicated HTTPS callback with no query string. Use a
-// distinct callback URI per issuer. The issuer must support client_secret_basic,
-// S256 and RS256. Transport defaults to the standard HTTPS transport.
+// distinct callback URI per issuer. The issuer must support client_secret_basic
+// and S256, and must sign ID tokens with RS256 unless SigningAlgs says otherwise.
+// Transport defaults to the standard HTTPS transport.
 type Config struct {
 	Issuer, ClientID, ClientSecret, RedirectURL string
 	Transport                                   http.RoundTripper
+	// SigningAlgs lists the signature algorithms accepted for ID tokens. When
+	// it is empty only RS256 is accepted. An ID token signed with any other
+	// algorithm is rejected, including RS256 when the list omits it.
+	SigningAlgs []SigningAlg
+}
+
+// SigningAlg names a JWS signature algorithm for ID tokens.
+type SigningAlg string
+
+const (
+	RS256 SigningAlg = "RS256" // RSASSA-PKCS1-v1_5 with SHA-256
+	PS256 SigningAlg = "PS256" // RSASSA-PSS with SHA-256
+	ES256 SigningAlg = "ES256" // ECDSA with P-256 and SHA-256
+	EdDSA SigningAlg = "EdDSA" // Ed25519
+)
+
+// signingAlgs returns a private copy of the accepted algorithms, or RS256
+// when none are listed. It reports false for an unknown or repeated entry.
+func signingAlgs(list []SigningAlg) ([]string, bool) {
+	if len(list) == 0 {
+		return []string{string(RS256)}, true
+	}
+	algs := make([]string, 0, len(list))
+	for _, alg := range list {
+		switch alg {
+		case RS256, PS256, ES256, EdDSA:
+		default:
+			return nil, false
+		}
+		if slices.Contains(algs, string(alg)) {
+			return nil, false
+		}
+		algs = append(algs, string(alg))
+	}
+	return algs, true
 }
 
 // Client manages browser logins for one configured issuer and client registration.
@@ -52,6 +88,7 @@ type Client struct {
 	issuer                string
 	oauth                 oauth2.Config
 	keys                  provider.KeySet
+	algs                  []string
 	http                  *http.Client
 	store                 Store
 	cookieName            string
@@ -66,8 +103,9 @@ func httpsURL(raw string, allowQuery bool) bool {
 
 // New discovers a fixed provider over HTTPS. Reuse the client across requests.
 func New(ctx context.Context, cfg Config, store Store) (*Client, error) {
+	algs, ok := signingAlgs(cfg.SigningAlgs)
 	if store == nil || !httpsURL(cfg.Issuer, false) || !httpsURL(cfg.RedirectURL, false) ||
-		cfg.ClientID == "" || cfg.ClientSecret == "" {
+		cfg.ClientID == "" || cfg.ClientSecret == "" || !ok {
 		return nil, errors.New("oidc: invalid client configuration")
 	}
 	transport := cfg.Transport
@@ -98,7 +136,7 @@ func New(ctx context.Context, cfg Config, store Store) (*Client, error) {
 	namespace, _ := json.Marshal([3]string{cfg.Issuer, cfg.ClientID, cfg.RedirectURL})
 	sum := sha256.Sum256(namespace)
 	return &Client{
-		issuer: cfg.Issuer, http: hc, store: store, requireResponseIssuer: meta.ResponseIssuer,
+		issuer: cfg.Issuer, http: hc, store: store, requireResponseIssuer: meta.ResponseIssuer, algs: algs,
 		cookieName: "__Host-authlume-oidc-" + base64.RawURLEncoding.EncodeToString(sum[:]),
 		oauth: oauth2.Config{
 			ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret, RedirectURL: cfg.RedirectURL,

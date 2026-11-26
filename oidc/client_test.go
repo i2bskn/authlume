@@ -2,6 +2,17 @@ package oidc
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	provider "github.com/coreos/go-oidc/v3/oidc"
+	"github.com/go-jose/go-jose/v4"
 	"golang.org/x/oauth2"
 )
 
@@ -237,5 +250,257 @@ func TestCanceledCallback(t *testing.T) {
 	r.AddCookie(c.cookie(browser, 60))
 	if _, err := c.Complete(httptest.NewRecorder(), r); !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+type signingKeys struct {
+	rsa     *rsa.PrivateKey
+	ec      *ecdsa.PrivateKey
+	ed      ed25519.PrivateKey
+	foreign *ecdsa.PrivateKey // P-256, never published
+	p384    *ecdsa.PrivateKey // never published
+}
+
+func newSigningKeys(t *testing.T) signingKeys {
+	t.Helper()
+	var k signingKeys
+	var err error
+	if k.rsa, err = rsa.GenerateKey(rand.Reader, 2048); err != nil {
+		t.Fatal(err)
+	}
+	if k.ec, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader); err != nil {
+		t.Fatal(err)
+	}
+	if _, k.ed, err = ed25519.GenerateKey(rand.Reader); err != nil {
+		t.Fatal(err)
+	}
+	if k.foreign, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader); err != nil {
+		t.Fatal(err)
+	}
+	if k.p384, err = ecdsa.GenerateKey(elliptic.P384(), rand.Reader); err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+func idTokenClaims(t *testing.T, issuer, audience string) []byte {
+	t.Helper()
+	now := time.Now()
+	payload, err := json.Marshal(map[string]any{
+		"iss": issuer, "aud": audience, "sub": "subject",
+		"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func signToken(t *testing.T, alg jose.SignatureAlgorithm, key any, kid string, payload []byte) string {
+	t.Helper()
+	opts := &jose.SignerOptions{}
+	if kid != "" {
+		opts = opts.WithHeader("kid", kid)
+	}
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: alg, Key: key}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jws, err := signer.Sign(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := jws.CompactSerialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// handBuiltToken assembles a compact JWS around the given signature bytes.
+func handBuiltToken(t *testing.T, alg, kid string, payload, signature []byte) string {
+	t.Helper()
+	fields := map[string]string{"alg": alg}
+	if kid != "" {
+		fields["kid"] = kid
+	}
+	header, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := base64.RawURLEncoding
+	return enc.EncodeToString(header) + "." + enc.EncodeToString(payload) + "." + enc.EncodeToString(signature)
+}
+
+func hmacToken(t *testing.T, kid string, payload, secret []byte) string {
+	t.Helper()
+	unsigned := handBuiltToken(t, "HS256", kid, payload, nil)
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(strings.TrimSuffix(unsigned, ".")))
+	return unsigned + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func tokenSignature(t *testing.T, raw string) []byte {
+	t.Helper()
+	sig, err := base64.RawURLEncoding.DecodeString(raw[strings.LastIndex(raw, ".")+1:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sig
+}
+
+func TestSigningAlgs(t *testing.T) {
+	const issuer, clientID, secret = "https://id.example", "client", "secret"
+	k := newSigningKeys(t)
+	payload := idTokenClaims(t, issuer, clientID)
+	pkix, err := x509.MarshalPKIXPublicKey(&k.rsa.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs256 := signToken(t, jose.RS256, k.rsa, "", payload)
+	es256 := signToken(t, jose.ES256, k.ec, "", payload)
+	tokens := map[string]string{
+		"RS256":                   rs256,
+		"PS256":                   signToken(t, jose.PS256, k.rsa, "", payload),
+		"ES256":                   es256,
+		"EdDSA":                   signToken(t, jose.EdDSA, k.ed, "", payload),
+		"RS384":                   signToken(t, jose.RS384, k.rsa, "", payload),
+		"PS384":                   signToken(t, jose.PS384, k.rsa, "", payload),
+		"ES384":                   signToken(t, jose.ES384, k.p384, "", payload),
+		"ES256 unpublished key":   signToken(t, jose.ES256, k.foreign, "", payload),
+		"none":                    handBuiltToken(t, "none", "", payload, nil),
+		"HS256 client secret":     hmacToken(t, "", payload, []byte(secret)),
+		"HS256 RSA public key":    hmacToken(t, "", payload, pkix),
+		"ES256 header, RSA bytes": handBuiltToken(t, "ES256", "", payload, tokenSignature(t, rs256)),
+		"RS256 header, EC bytes":  handBuiltToken(t, "RS256", "", payload, tokenSignature(t, es256)),
+	}
+	// Every published key is always present, so a listed algorithm is the
+	// only thing standing between a well-signed token and acceptance.
+	keys := &provider.StaticKeySet{PublicKeys: []crypto.PublicKey{&k.rsa.PublicKey, &k.ec.PublicKey, k.ed.Public()}}
+	all := []string{"RS256", "PS256", "ES256", "EdDSA"}
+	for _, tt := range []struct {
+		name     string
+		algs     []string
+		accepted []string
+		rejected []string
+	}{
+		{"unset", nil, []string{"RS256"}, []string{"PS256", "ES256", "EdDSA", "none", "HS256 client secret", "HS256 RSA public key"}},
+		{"empty", []string{}, []string{"RS256"}, []string{"PS256", "ES256", "EdDSA"}},
+		{"RS256", []string{"RS256"}, []string{"RS256"}, []string{"PS256", "ES256", "EdDSA"}},
+		{"PS256", []string{"PS256"}, []string{"PS256"}, []string{"RS256", "ES256", "EdDSA"}},
+		{"ES256", []string{"ES256"}, []string{"ES256"}, []string{"RS256", "PS256", "EdDSA", "ES256 unpublished key"}},
+		{"EdDSA", []string{"EdDSA"}, []string{"EdDSA"}, []string{"RS256", "PS256", "ES256"}},
+		{"ES256 and EdDSA", []string{"ES256", "EdDSA"}, []string{"ES256", "EdDSA"}, []string{"RS256", "PS256"}},
+		{"RS256 and PS256", []string{"RS256", "PS256"}, []string{"RS256", "PS256"}, []string{"ES256", "EdDSA"}},
+		{"RS256 and ES256", []string{"RS256", "ES256"}, []string{"RS256", "ES256"},
+			[]string{"PS256", "EdDSA", "ES256 header, RSA bytes", "RS256 header, EC bytes"}},
+		{"all four", all, all, []string{"RS384", "PS384", "ES384", "ES256 unpublished key", "none",
+			"HS256 client secret", "HS256 RSA public key", "ES256 header, RSA bytes", "RS256 header, EC bytes"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{issuer: issuer, keys: keys, algs: tt.algs,
+				oauth: oauth2.Config{ClientID: clientID, ClientSecret: secret}}
+			for _, name := range tt.accepted {
+				if _, err := c.verifyToken(t.Context(), tokens[name]); err != nil {
+					t.Errorf("%s: got %v", name, err)
+				}
+			}
+			for _, name := range tt.rejected {
+				if _, err := c.verifyToken(t.Context(), tokens[name]); !errors.Is(err, ErrInvalid) {
+					t.Errorf("%s: got %v, want ErrInvalid", name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestSigningAlgsFromConfiguration(t *testing.T) {
+	const clientID, secret = "client", "secret"
+	k := newSigningKeys(t)
+	idp := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u := "https://" + r.Host
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/keys" {
+			json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
+				{Key: &k.rsa.PublicKey, KeyID: "rsa", Use: "sig"},
+				{Key: &k.ec.PublicKey, KeyID: "ec", Use: "sig"},
+				{Key: k.ed.Public(), KeyID: "ed", Use: "sig"},
+			}})
+			return
+		}
+		w.Write([]byte(`{"issuer":"` + u + `","authorization_endpoint":"` + u + `/auth","token_endpoint":"` + u +
+			`/token","jwks_uri":"` + u + `/keys"}`))
+	}))
+	defer idp.Close()
+	payload := idTokenClaims(t, idp.URL, clientID)
+	tokens := map[string]string{
+		"RS256": signToken(t, jose.RS256, k.rsa, "rsa", payload),
+		"PS256": signToken(t, jose.PS256, k.rsa, "rsa", payload),
+		"ES256": signToken(t, jose.ES256, k.ec, "ec", payload),
+		"EdDSA": signToken(t, jose.EdDSA, k.ed, "ed", payload),
+		"none":  handBuiltToken(t, "none", "rsa", payload, nil),
+		"HS256": hmacToken(t, "rsa", payload, []byte(secret)),
+	}
+	for _, tt := range []struct {
+		name     string
+		algs     []SigningAlg
+		accepted []string
+		rejected []string
+	}{
+		{"unset", nil, []string{"RS256"}, []string{"PS256", "ES256", "EdDSA"}},
+		{"without RS256", []SigningAlg{PS256, ES256, EdDSA}, []string{"PS256", "ES256", "EdDSA"}, []string{"RS256"}},
+		{"all four", []SigningAlg{RS256, PS256, ES256, EdDSA}, []string{"RS256", "PS256", "ES256", "EdDSA"}, []string{"none", "HS256"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{Issuer: idp.URL, ClientID: clientID, ClientSecret: secret, RedirectURL: "https://app.example/callback",
+				Transport: idp.Client().Transport, SigningAlgs: tt.algs}
+			c, err := New(t.Context(), cfg, NewMemoryStore())
+			if err != nil {
+				t.Fatal(err)
+			}
+			check := func() {
+				t.Helper()
+				for _, name := range tt.accepted {
+					if _, err := c.verifyToken(t.Context(), tokens[name]); err != nil {
+						t.Errorf("%s: got %v", name, err)
+					}
+				}
+				for _, name := range tt.rejected {
+					if _, err := c.verifyToken(t.Context(), tokens[name]); !errors.Is(err, ErrInvalid) {
+						t.Errorf("%s: got %v, want ErrInvalid", name, err)
+					}
+				}
+			}
+			check()
+			if len(cfg.SigningAlgs) > 0 {
+				// The caller's slice is not the client's configuration.
+				cfg.SigningAlgs[0] = SigningAlg(tt.rejected[0])
+				check()
+			}
+		})
+	}
+}
+
+type countingTransport struct{ calls atomic.Int32 }
+
+func (c *countingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	c.calls.Add(1)
+	return nil, errors.New("unexpected provider request")
+}
+
+func TestInvalidSigningAlgs(t *testing.T) {
+	for _, algs := range [][]SigningAlg{
+		{""}, {"none"}, {"HS256"}, {"RS384"}, {"rs256"},
+		{"none", RS256}, {RS256, "none"}, {ES256, ES256}, {RS256, PS256, RS256},
+	} {
+		var transport countingTransport
+		cfg := Config{Issuer: "https://issuer.example", ClientID: "app", ClientSecret: "secret",
+			RedirectURL: "https://app.example/callback", Transport: &transport, SigningAlgs: algs}
+		if _, err := New(t.Context(), cfg, NewMemoryStore()); err == nil || !strings.Contains(err.Error(), "configuration") {
+			t.Errorf("algorithms %q: got %v", algs, err)
+		}
+		if transport.calls.Load() != 0 {
+			t.Errorf("algorithms %q: contacted the provider", algs)
+		}
 	}
 }

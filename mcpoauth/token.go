@@ -36,9 +36,11 @@ const maxBody = 16 << 10
 // failure is an error response of the token or revocation endpoint.
 type failure struct {
 	status int
-	code   string
-	basic  bool // challenge with WWW-Authenticate: Basic
-	err    error
+	code   string // empty for a response without a body
+	basic  bool   // challenge with WWW-Authenticate: Basic
+	// challenge, when set, is the WWW-Authenticate value.
+	challenge string
+	err       error
 }
 
 func badRequest(code string) *failure {
@@ -70,6 +72,13 @@ func (f *failure) write(w http.ResponseWriter) {
 	if f.basic {
 		w.Header().Set("WWW-Authenticate", `Basic realm="mcpoauth"`)
 	}
+	if f.challenge != "" {
+		w.Header().Set("WWW-Authenticate", f.challenge)
+	}
+	if f.code == "" {
+		w.WriteHeader(f.status)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(f.status)
 	io.WriteString(w, `{"error":"`+f.code+`"}`)
@@ -98,10 +107,15 @@ func form(w http.ResponseWriter, r *http.Request, names ...string) (url.Values, 
 
 // authenticate identifies the client by HTTP Basic or by body parameters. A
 // public client is identified only; a secret it presents is ignored.
-func (s *Server) authenticate(r *http.Request, values url.Values) (Client, *failure) {
+//
+// A client resolved from a metadata document authenticates with no method at
+// all: any credential is refused before the document is fetched. A
+// registered client may present a secret, which is ignored, but no
+// assertion.
+func (s *Server) authenticate(r *http.Request, values url.Values) (resolved, *failure) {
 	headers := r.Header.Values("Authorization")
 	if len(headers) > 1 {
-		return Client{}, badRequest("invalid_request")
+		return resolved{}, badRequest("invalid_request")
 	}
 	basic := len(headers) == 1
 	var id, secret string
@@ -109,38 +123,49 @@ func (s *Server) authenticate(r *http.Request, values url.Values) (Client, *fail
 		scheme, _, _ := strings.Cut(headers[0], " ")
 		user, pass, ok := r.BasicAuth()
 		if !strings.EqualFold(scheme, "Basic") || !ok {
-			return Client{}, unauthorized(true)
+			return resolved{}, unauthorized(true)
 		}
 		// RFC 6749 section 2.3.1 form-encodes both values before Basic encoding.
 		var errID, errSecret error
 		id, errID = url.QueryUnescape(user)
 		secret, errSecret = url.QueryUnescape(pass)
 		if errID != nil || errSecret != nil {
-			return Client{}, unauthorized(true)
+			return resolved{}, unauthorized(true)
 		}
 		if values.Get("client_secret") != "" {
-			return Client{}, badRequest("invalid_request")
+			return resolved{}, badRequest("invalid_request")
 		}
 		if bodyID := values.Get("client_id"); bodyID != "" && bodyID != id {
-			return Client{}, badRequest("invalid_request")
+			return resolved{}, badRequest("invalid_request")
 		}
 	} else {
 		id, secret = values.Get("client_id"), values.Get("client_secret")
 	}
 	if !validClientID(id) {
-		return Client{}, unauthorized(basic)
+		return resolved{}, unauthorized(basic)
 	}
-	client, err := s.client(r.Context(), id)
-	if errors.Is(err, ErrNotFound) {
-		return Client{}, unauthorized(basic)
+	client, err := s.resolve(r.Context(), id, forToken, func(source ClientSource) error {
+		assertion := values.Has("client_assertion") || values.Has("client_assertion_type")
+		if assertion || (source == SourceMetadata && (basic || values.Has("client_secret"))) {
+			return errCredentials
+		}
+		return nil
+	})
+	if errors.Is(err, ErrNotFound) || errors.Is(err, errCredentials) {
+		return resolved{}, unauthorized(basic)
+	}
+	if errors.Is(err, ErrMetadata) {
+		f := unauthorized(basic)
+		f.err = fmt.Errorf("%w: %w", ErrClient, err)
+		return resolved{}, f
 	}
 	if err != nil {
-		return Client{}, unavailable(err)
+		return resolved{}, unavailable(err)
 	}
 	if client.Secret != nil {
 		digest := sha256.Sum256([]byte(secret))
 		if secret == "" || subtle.ConstantTimeCompare(digest[:], client.Secret[:]) != 1 {
-			return Client{}, unauthorized(basic)
+			return resolved{}, unauthorized(basic)
 		}
 	}
 	return client, nil
@@ -179,7 +204,7 @@ func (s *Server) Token(w http.ResponseWriter, r *http.Request) (Event, error) {
 
 func (s *Server) token(w http.ResponseWriter, r *http.Request, event *Event) ([]byte, *failure) {
 	values, f := form(w, r, "grant_type", "code", "redirect_uri", "code_verifier", "client_id",
-		"client_secret", "refresh_token", "scope", "resource")
+		"client_secret", "client_assertion", "client_assertion_type", "refresh_token", "scope", "resource")
 	if f != nil {
 		return nil, f
 	}
@@ -196,7 +221,7 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request, event *Event) ([]
 		return s.exchange(r.Context(), client, values, event)
 	case "refresh_token":
 		event.Grant = grant
-		return s.refresh(r.Context(), client, values, event)
+		return s.refresh(r.Context(), client.Client, values, event)
 	default:
 		return nil, badRequest("unsupported_grant_type")
 	}
@@ -217,7 +242,7 @@ func validVerifier(v string) bool {
 }
 
 // exchange redeems an authorization code for a new connection.
-func (s *Server) exchange(ctx context.Context, client Client, values url.Values, event *Event) ([]byte, *failure) {
+func (s *Server) exchange(ctx context.Context, client resolved, values url.Values, event *Event) ([]byte, *failure) {
 	code, verifier := values.Get("code"), values.Get("code_verifier")
 	if code == "" || verifier == "" {
 		return nil, badRequest("invalid_request")
@@ -267,6 +292,16 @@ func (s *Server) exchange(ctx context.Context, client Client, values url.Values,
 	challenge := base64.RawURLEncoding.EncodeToString(digest[:])
 	if subtle.ConstantTimeCompare([]byte(challenge), []byte(record.Challenge)) != 1 {
 		return nil, badRequest("invalid_grant")
+	}
+	// The first connection keeps a registration from expiring unused.
+	if client.source == SourceRegistration {
+		err := s.registration.store.Activate(ctx, client.ID, now)
+		if errors.Is(err, ErrNotFound) {
+			return nil, badRequest("invalid_grant")
+		}
+		if err != nil {
+			return nil, unavailable(fmt.Errorf("mcpoauth: activate registration: %w", err))
+		}
 	}
 
 	var selector [selectorSize]byte
@@ -406,7 +441,8 @@ func (s *Server) Revocation(w http.ResponseWriter, r *http.Request) (Event, erro
 }
 
 func (s *Server) revocation(w http.ResponseWriter, r *http.Request, event *Event) *failure {
-	values, f := form(w, r, "token", "token_type_hint", "client_id", "client_secret")
+	values, f := form(w, r, "token", "token_type_hint", "client_id", "client_secret",
+		"client_assertion", "client_assertion_type")
 	if f != nil {
 		return f
 	}

@@ -47,6 +47,7 @@
 package mcpoauth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -124,15 +125,41 @@ type Config struct {
 	// Metadata adds members to the authorization server metadata, such as
 	// registration_endpoint for an application with its own registration. It
 	// cannot replace a member this package emits and must encode as JSON.
+	// While MetadataDocuments is set it cannot hold
+	// client_id_metadata_document_supported, and while Registration is set
+	// it cannot hold registration_endpoint.
 	Metadata map[string]any
 
 	Now func() time.Time
+
+	// MetadataDocuments enables Client ID Metadata Documents: a client_id
+	// that is an HTTPS URL names a document that the server fetches. Nil
+	// disables them.
+	MetadataDocuments *MetadataDocumentConfig
+	// Registration enables RFC 7591 dynamic client registration for public
+	// clients through Server.Register. Nil disables it.
+	Registration *RegistrationConfig
+
+	// RestrictDynamicScopes limits the scopes of a client resolved from a
+	// metadata document or a registration to DynamicScopes. It works like
+	// Client.RestrictScopes, except that an authorization request's known
+	// scopes outside the list are dropped rather than rejected. When it is
+	// false DynamicScopes must be empty, and when it is true DynamicScopes
+	// holds 1 to 64 distinct scopes of Scopes.
+	RestrictDynamicScopes bool
+	DynamicScopes         []string
 }
 
 // Server is safe for concurrent use. Construct it with New.
 type Server struct {
 	clients ClientLookup
 	store   Store
+
+	docs         *metadataDocs // nil when metadata documents are disabled
+	registration *registration // nil when registration is disabled
+
+	restrictDynamic bool
+	dynamicScopes   []string
 
 	issuer, resource           string
 	resourceHost, resourcePath string
@@ -183,8 +210,12 @@ func scopeToken(s string) bool {
 
 // New validates the configuration. Reuse the server across requests.
 func New(cfg Config, clients ClientLookup, store Store) (*Server, error) {
-	if clients == nil || store == nil {
+	dynamic := cfg.MetadataDocuments != nil || cfg.Registration != nil
+	if (clients == nil && !dynamic) || store == nil {
 		return nil, errors.New("mcpoauth: client lookup and store are required")
+	}
+	if clients == nil {
+		clients = func(context.Context, string) (Client, error) { return Client{}, ErrNotFound }
 	}
 	issuer, validIssuer := identifier(cfg.Issuer)
 	resource, validResource := identifier(cfg.Resource)
@@ -223,6 +254,14 @@ func New(cfg Config, clients ClientLookup, store Store) (*Server, error) {
 		cfg.ConnectionAbsolute < 0 || (cfg.ConnectionAbsolute != 0 && cfg.ConnectionAbsolute < cfg.AccessTTL) {
 		return nil, errors.New("mcpoauth: invalid lifetimes")
 	}
+	if cfg.RestrictDynamicScopes != (len(cfg.DynamicScopes) > 0) || len(cfg.DynamicScopes) > maxClientScopes {
+		return nil, errScopes
+	}
+	for i, scope := range cfg.DynamicScopes {
+		if _, defined := known[scope]; !defined || slices.Contains(cfg.DynamicScopes[:i], scope) {
+			return nil, errScopes
+		}
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -232,12 +271,14 @@ func New(cfg Config, clients ClientLookup, store Store) (*Server, error) {
 		resourceHost: resource.Host, resourcePath: resource.Path,
 		scopes: slices.Clone(cfg.Scopes), defaults: slices.Clone(cfg.DefaultScopes), known: known,
 		accessTTL: cfg.AccessTTL, refreshIdle: cfg.RefreshIdle, absolute: cfg.ConnectionAbsolute,
-		now:                  cfg.Now,
+		now:             cfg.Now,
+		restrictDynamic: cfg.RestrictDynamicScopes, dynamicScopes: slices.Clone(cfg.DynamicScopes),
 		metadataPath:         "/.well-known/oauth-authorization-server" + issuer.Path,
 		resourceMetadataPath: "/.well-known/oauth-protected-resource" + resource.Path,
 	}
 	s.resourceMetadataURL = "https://" + resource.Host + s.resourceMetadataPath
 
+	var err error
 	methods := []string{"none", "client_secret_basic", "client_secret_post"}
 	metadata := map[string]any{
 		"issuer":                                         cfg.Issuer,
@@ -252,6 +293,22 @@ func New(cfg Config, clients ClientLookup, store Store) (*Server, error) {
 		"scopes_supported":                               s.scopes,
 		"authorization_response_iss_parameter_supported": true,
 	}
+	if cfg.Registration != nil {
+		if s.registration, err = newRegistration(*cfg.Registration); err != nil {
+			return nil, err
+		}
+		metadata["registration_endpoint"] = cfg.Registration.Endpoint
+	}
+	if cfg.MetadataDocuments != nil {
+		own := []string{cfg.Issuer, cfg.Resource, cfg.AuthorizationEndpoint, cfg.TokenEndpoint, cfg.RevocationEndpoint}
+		if cfg.Registration != nil {
+			own = append(own, cfg.Registration.Endpoint)
+		}
+		if s.docs, err = newMetadataDocs(*cfg.MetadataDocuments, own, cfg.Now); err != nil {
+			return nil, err
+		}
+		metadata["client_id_metadata_document_supported"] = true
+	}
 	errMetadata := errors.New("mcpoauth: invalid metadata")
 	for name, value := range cfg.Metadata {
 		if _, reserved := metadata[name]; reserved {
@@ -259,7 +316,6 @@ func New(cfg Config, clients ClientLookup, store Store) (*Server, error) {
 		}
 		metadata[name] = value
 	}
-	var err error
 	if s.metadata, err = json.Marshal(metadata); err != nil {
 		return nil, errMetadata
 	}

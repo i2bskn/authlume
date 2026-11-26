@@ -20,6 +20,13 @@ type Request struct {
 	// may be granted.
 	Scopes []string
 	State  string
+	// ClientSource tells where the client was resolved from.
+	ClientSource ClientSource
+	// ClientHost is the authority of the client_id URL, a lowercase host
+	// name and an optional port, when ClientSource is SourceMetadata, and
+	// empty otherwise. Show it on the consent screen: unlike ClientName,
+	// which the client asserts, it is verified by the fetch.
+	ClientHost string
 }
 
 // RejectError is a failure that may be reported to the client, whose identity
@@ -34,8 +41,8 @@ type RejectError struct {
 	Code string
 	// RedirectURL is the client's redirect URI with error, state and iss.
 	RedirectURL string
-	// Request carries ClientID, ClientName, RedirectURI and State for an
-	// error page. Scopes is nil.
+	// Request carries ClientID, ClientName, RedirectURI, State,
+	// ClientSource and ClientHost for an error page. Scopes is nil.
 	Request Request
 }
 
@@ -93,19 +100,19 @@ func (s *Server) authorize(ctx context.Context, rawQuery string) (*authorization
 		"code_challenge", "code_challenge_method", "resource") {
 		return nil, ErrInvalid
 	}
-	clientID := params.Get("client_id")
-	if !validClientID(clientID) {
+	clientID, redirectURI, state := params.Get("client_id"), params.Get("redirect_uri"), params.Get("state")
+	// A request that fails anyway must not cause a metadata document fetch.
+	if !validClientID(clientID) || redirectURI == "" || len(redirectURI) > maxRedirectURI {
 		return nil, ErrInvalid
 	}
-	client, err := s.client(ctx, clientID)
+	client, err := s.resolve(ctx, clientID, forAuthorization, nil)
 	if errors.Is(err, ErrNotFound) {
-		return nil, ErrInvalid
+		return nil, ErrUnknownClient
 	}
 	if err != nil {
 		return nil, err
 	}
-	redirectURI, state := params.Get("redirect_uri"), params.Get("state")
-	if redirectURI == "" || !slices.ContainsFunc(client.RedirectURIs, func(registered string) bool {
+	if !slices.ContainsFunc(client.RedirectURIs, func(registered string) bool {
 		return matchRedirect(registered, redirectURI)
 	}) || len(state) > maxState {
 		return nil, ErrInvalid
@@ -119,7 +126,10 @@ func (s *Server) authorize(ctx context.Context, rawQuery string) (*authorization
 		return nil, ErrInvalid
 	}
 	a := &authorization{
-		request:  Request{ClientID: client.ID, ClientName: client.Name, RedirectURI: redirectURI, State: state},
+		request: Request{
+			ClientID: client.ID, ClientName: client.Name, RedirectURI: redirectURI, State: state,
+			ClientSource: client.source, ClientHost: client.host,
+		},
 		redirect: redirect, query: query,
 	}
 	reject := func(code string) (*authorization, error) {
@@ -140,15 +150,25 @@ func (s *Server) authorize(ctx context.Context, rawQuery string) (*authorization
 	if resource := params.Get("resource"); resource != "" && !s.matchResource(resource) {
 		return reject("invalid_target")
 	}
+	// A dynamic client's known scope outside its limit is dropped, since an
+	// MCP client may request every scope the server supports.
+	dynamic := client.source != SourceLookup
 	var scopes []string
+	requested := false
 	for scope := range strings.SplitSeq(params.Get("scope"), " ") {
 		if scope == "" || slices.Contains(scopes, scope) {
 			continue
 		}
-		if _, ok := s.known[scope]; !ok || !client.allows(scope) {
+		requested = true
+		if _, ok := s.known[scope]; !ok || (!dynamic && !client.allows(scope)) {
 			return reject("invalid_scope")
 		}
-		scopes = append(scopes, scope)
+		if client.allows(scope) {
+			scopes = append(scopes, scope)
+		}
+	}
+	if requested && len(scopes) == 0 {
+		return reject("invalid_scope")
 	}
 	if len(scopes) == 0 {
 		for _, scope := range s.defaults {

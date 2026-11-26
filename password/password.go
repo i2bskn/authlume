@@ -143,9 +143,9 @@ func WithAlgorithm(alg Algorithm) Option {
 //
 // Records of users who never sign in stay unmigrated and return ErrRecord once
 // the option is removed. Before removing it, count them by calling NeedsRehash
-// for each record, or by matching the record prefixes documented in
-// docs/phase-one.md in a query, and decide what happens to them, for example a
-// forced password reset.
+// for each record, or by matching the record prefixes documented at
+// https://docs.i2bskn.com/authlume/reference/design/ in a query, and decide what
+// happens to them, for example a forced password reset.
 func WithMigrationFrom(algs ...Algorithm) Option {
 	migration := slices.Clone(algs)
 	return func(c *config) { c.migration = migration }

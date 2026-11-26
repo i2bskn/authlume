@@ -27,14 +27,6 @@ Open <https://127.0.0.1:8444/> with the temporary certificate trusted for this d
 
 By default, Authlume checks the server's current 30-second step and the immediately preceding step. The matched step must be newer than the last one consumed for that enrollment. If a device clock is ahead but still in the same step, its code can succeed. If the device already shows the next step, the server will first check that step when it begins. Keep the device and server clocks synchronized. To accept only the current step, create the verifier with `totp.New(store, nil, totp.WithCurrentStepOnly())`. A code entered near the end of its step then fails once the next step begins, and a device whose clock is slow enough to still show the preceding step always fails. The sample runs with the default. It holds replay state in one process and excludes the startup step and earlier steps after each restart.
 
-## Migrating an existing enrollment
+## Integrate with an application
 
-Authlume requires at least 20 decoded bytes per TOTP secret. A legacy 16-character Base32 secret decodes to 10 bytes (80 bits), so verification returns `totp.ErrRecord` for that enrollment. Before switching the account to Authlume, use the application's verified enrollment or recovery flow to register and confirm a fresh random secret of at least 20 bytes with the user's authenticator.
-
-## Use TOTP with another primary method
-
-Import `github.com/i2bskn/authlume/totp` and implement its `Store` for your own verified application subjects. For multiple instances, share durable replay state. An implementation can consume a code with one conditional database update matching the subject and active enrollment ID and requiring a null or smaller last-used time step. Exactly one changed row means success. Protect seeds at rest, return a stable snapshot from `Load`, and give each new enrollment a fresh cryptographically random secret and unique activation ID. The application owns enrollment confirmation, recovery, credential changes and rate limits that span login attempts.
-
-After primary authentication, apply the application's MFA policy. If TOTP is required, pass the verified subject and submitted code to `verifier.Verify(ctx, subject, code)`. Only a successful verification permits that policy path to call `sessions.Issue`. If session issuance fails, start a fresh login with a newer code. For a flow spanning multiple requests, retain the verified subject and purpose in an expiring, browser-bound, single-use server-side login transaction. For OIDC, accepting upstream MFA assurance requires an explicit application policy over verified evidence. The presence of a claim alone leaves the additional factor pending.
-
-The [WebAuthn example](../webauthn) demonstrates a separate public-key ceremony for the same first-factor subject. Username-less passkey sign-in requires its own application policy and flow.
+See the [documentation](https://docs.i2bskn.com/authlume/guides/totp/).

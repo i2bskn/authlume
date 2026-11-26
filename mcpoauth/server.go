@@ -3,10 +3,13 @@
 // authorization codes bound to PKCE, exchanges and rotates tokens, revokes
 // connections and verifies access tokens on the protected resource.
 //
-// The application owns user authentication, the consent screen, client
-// registration, rate limits, CORS and audit storage. Clients are resolved
-// through a ClientLookup, so an application keeps its own registration
-// process. The package depends on the standard library only.
+// The application owns user authentication, the consent screen, rate limits,
+// CORS and audit storage. Clients are resolved through a ClientLookup, so an
+// application can keep its own registration process. Config.MetadataDocuments
+// additionally accepts an HTTPS client_id naming a Client ID Metadata
+// Document, and Config.Registration serves RFC 7591 dynamic client
+// registration through Server.Register; clients from both are public. The
+// package depends on the standard library only.
 //
 // Tokens are opaque random values. Access tokens live for one hour by default
 // and are renewed with a rotating refresh token. A rotated refresh token that
@@ -44,6 +47,15 @@
 //   - A client record that fails Client.Validate, such as a custom scheme
 //     redirect URI or more than 16 URIs, yields ErrRecord and a 503 from the
 //     token endpoint. Reject such clients with Validate at registration.
+//   - Metadata documents and dynamic registration drop redirect URIs that
+//     Client.Validate would refuse, such as custom schemes, ignore
+//     grant_types and response_types beyond their checks, and always treat
+//     the client as public, answering token_endpoint_auth_method "none".
+//     A document whose method needs a shared secret is refused, and a
+//     client_assertion from such a client is refused at the token endpoint.
+//   - A metadata document is fetched without a proxy, only from public
+//     addresses, and a NAT64 address is judged by the IPv4 address it
+//     embeds.
 package mcpoauth
 
 import (

@@ -237,3 +237,10 @@ func TestMemoryStoreRevokeSubject(t *testing.T) {
 		t.Fatalf("another subject's code: %v", err)
 	}
 }
+
+func TestMemoryClientStore(t *testing.T) {
+	storetest.RunClientStore(t, func(*testing.T) mcpoauth.ClientStore { return mcpoauth.NewMemoryClientStore() })
+	t.Run("zero value", func(t *testing.T) {
+		storetest.RunClientStore(t, func(*testing.T) mcpoauth.ClientStore { return new(mcpoauth.MemoryClientStore) })
+	})
+}

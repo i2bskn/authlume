@@ -30,7 +30,7 @@ Run them with `go test -race ./...`.
 | `totp` | The RFC 6238 test vectors, the acceptance window, replay and the HTTPS sample |
 | `webauthn` | Registration, verification and passkey sign-in with a software authenticator, and the HTTPS sample's handler |
 | `oidc` | The whole flow against a local signed test issuer, including each accepted signature algorithm |
-| `mcpoauth` | Authorization, code exchange, refresh, reuse detection and revocation, the store contract and the HTTPS sample |
+| `mcpoauth` | Authorization, code exchange, refresh, reuse detection and revocation, client ID metadata documents against a local TLS server, dynamic client registration, both store contracts and the HTTPS sample |
 
 ## What is not covered
 
@@ -40,7 +40,6 @@ Run them with `go test -race ./...`.
 
 ## Not included
 
-- Dynamic client registration and client ID metadata documents for MCP OAuth. An application can provide its own registration and resolve clients through `mcpoauth.ClientLookup`.
 - SAML, and out-of-band factors such as codes sent by SMS or email.
 - An OpenID Provider. The `oidc` package is a relying party only.
 - User management, invitations and roles.

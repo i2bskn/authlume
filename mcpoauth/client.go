@@ -87,33 +87,42 @@ func (c Client) Validate() error {
 		}
 	}
 	for _, raw := range c.RedirectURIs {
-		u, err := url.Parse(raw)
-		if err != nil || len(raw) > maxRedirectURI || u.User != nil || strings.Contains(raw, "#") {
+		if !validRedirectURI(raw) {
 			return ErrRecord
-		}
-		switch u.Scheme {
-		case "https":
-			if u.Hostname() == "" {
-				return ErrRecord
-			}
-		case "http":
-			if !loopback(u.Hostname()) {
-				return ErrRecord
-			}
-		default:
-			return ErrRecord
-		}
-		query, err := url.ParseQuery(u.RawQuery)
-		if err != nil {
-			return ErrRecord
-		}
-		for _, reserved := range []string{"code", "state", "iss", "error"} {
-			if query.Has(reserved) {
-				return ErrRecord
-			}
 		}
 	}
 	return nil
+}
+
+// validRedirectURI applies the redirect URI rules of Client.Validate to one
+// URI.
+func validRedirectURI(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || len(raw) > maxRedirectURI || u.User != nil || strings.Contains(raw, "#") {
+		return false
+	}
+	switch u.Scheme {
+	case "https":
+		if u.Hostname() == "" {
+			return false
+		}
+	case "http":
+		if !loopback(u.Hostname()) {
+			return false
+		}
+	default:
+		return false
+	}
+	query, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return false
+	}
+	for _, reserved := range []string{"code", "state", "iss", "error"} {
+		if query.Has(reserved) {
+			return false
+		}
+	}
+	return true
 }
 
 // matchRedirect compares a presented redirect_uri with one registered URI.
@@ -133,17 +142,87 @@ func matchRedirect(registered, presented string) bool {
 		got.RawQuery == want.RawQuery && got.ForceQuery == want.ForceQuery
 }
 
-// client resolves and checks a client record. It returns ErrNotFound as is.
-func (s *Server) client(ctx context.Context, id string) (Client, error) {
+// ClientSource tells where the server resolved a client from. The zero value
+// is unknown and matches no constant.
+type ClientSource int
+
+const (
+	// SourceLookup is a client that the ClientLookup returned.
+	SourceLookup ClientSource = iota + 1
+	// SourceMetadata is a client built from a Client ID Metadata Document.
+	SourceMetadata
+	// SourceRegistration is a client registered through Server.Register.
+	SourceRegistration
+)
+
+// resolved is a client with where it came from. host is the authority of a
+// metadata document's client_id and empty otherwise.
+type resolved struct {
+	Client
+	source ClientSource
+	host   string
+}
+
+// purpose selects how a metadata document may be served from the cache.
+type purpose int
+
+const (
+	// forAuthorization uses an entry fetched within the last 30 seconds and,
+	// when a fetch fails temporarily, a fresh one.
+	forAuthorization purpose = iota
+	// forToken uses a fresh entry and, when a fetch fails temporarily, a
+	// stale one.
+	forToken
+)
+
+// errCredentials is returned by a resolve guard that refuses a dynamic client
+// before any fetch.
+var errCredentials = errors.New("mcpoauth: credentials for a client without a secret")
+
+// resolve finds a client in the order ClientLookup, metadata document, then
+// registration. It returns ErrNotFound for an unknown client, a
+// *MetadataError for a document that cannot be used and any other error for
+// a backend or temporary failure. guard, when set, runs once a dynamic source
+// is chosen and before it is consulted; its error is returned as is.
+func (s *Server) resolve(ctx context.Context, id string, use purpose, guard func(ClientSource) error) (resolved, error) {
 	client, err := s.clients(ctx, id)
-	if errors.Is(err, ErrNotFound) {
-		return Client{}, ErrNotFound
+	if err == nil {
+		if client.Validate() != nil || client.ID != id {
+			return resolved{}, ErrRecord
+		}
+		return resolved{Client: client, source: SourceLookup}, nil
 	}
-	if err != nil {
-		return Client{}, fmt.Errorf("mcpoauth: lookup client: %w", err)
+	if !errors.Is(err, ErrNotFound) {
+		return resolved{}, fmt.Errorf("mcpoauth: lookup client: %w", err)
 	}
-	if client.Validate() != nil || client.ID != id {
-		return Client{}, ErrRecord
+	var source ClientSource
+	switch {
+	case strings.HasPrefix(id, "https://"):
+		if s.docs == nil {
+			return resolved{}, ErrNotFound
+		}
+		source = SourceMetadata
+	case s.registration != nil && validValue(id):
+		source = SourceRegistration
+	default:
+		return resolved{}, ErrNotFound
 	}
-	return client, nil
+	if guard != nil {
+		if err := guard(source); err != nil {
+			return resolved{}, err
+		}
+	}
+	if source == SourceMetadata {
+		return s.metadataClient(ctx, id, use)
+	}
+	return s.registeredClient(ctx, id)
+}
+
+// dynamicClient builds the record of a client resolved from a metadata
+// document or a registration.
+func (s *Server) dynamicClient(id, name string, redirectURIs []string) Client {
+	return Client{
+		ID: id, Name: name, RedirectURIs: redirectURIs,
+		RestrictScopes: s.restrictDynamic, Scopes: s.dynamicScopes,
+	}
 }

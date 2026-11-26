@@ -488,7 +488,11 @@ func TestUninitializedServer(t *testing.T) {
 					t.Fatalf("error %v", err)
 				}
 			}
-			for _, handle := range []handlerFunc{s.Token, s.Revocation} {
+			register := func(w http.ResponseWriter, r *http.Request) (Event, error) {
+				_, err := s.Register(w, r)
+				return Event{}, err
+			}
+			for _, handle := range []handlerFunc{s.Token, s.Revocation, register} {
 				r := post(t, handle, refreshForm("x"))
 				if r.status != http.StatusInternalServerError || r.body != "" || r.err == nil || r.err.Error() != message {
 					t.Fatalf("status %d body %q err %v", r.status, r.body, r.err)

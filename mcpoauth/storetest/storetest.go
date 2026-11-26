@@ -1,5 +1,5 @@
-// Package storetest checks that an implementation of mcpoauth.Store meets the
-// interface's contract.
+// Package storetest checks that implementations of mcpoauth.Store and
+// mcpoauth.ClientStore meet their interfaces' contracts.
 package storetest
 
 import (

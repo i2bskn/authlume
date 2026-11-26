@@ -265,3 +265,99 @@ func TestApproveAndDeny(t *testing.T) {
 		t.Fatal("repeated code")
 	}
 }
+
+// restrict replaces the public client's record with one limited to scopes.
+func (f *fixture) restrict(scopes ...string) {
+	client := f.clients["public"]
+	client.RestrictScopes, client.Scopes = true, scopes
+	f.clients["public"] = client
+}
+
+func TestAuthorizeClientScopes(t *testing.T) {
+	const rejected = "invalid_scope"
+	twoDefaults := func(c *Config) { c.DefaultScopes = []string{"read", "write"} }
+	for _, tc := range []struct {
+		name   string
+		config []func(*Config)
+		list   []string
+		scope  string // "-" omits the parameter
+		want   string // the granted scopes, or rejected
+	}{
+		{name: "listed scopes", list: []string{"write", "read"}, scope: "write read", want: "write read"},
+		{name: "one listed scope", list: []string{"write", "read"}, scope: "read", want: "read"},
+		{name: "scope outside the list", list: []string{"write", "read"}, scope: "read admin", want: rejected},
+		{name: "only a scope outside the list", list: []string{"write", "read"}, scope: "admin", want: rejected},
+		{name: "unknown scope", list: []string{"write", "read", "other"}, scope: "read other", want: rejected},
+		{name: "omitted scope in the default order", config: []func(*Config){twoDefaults}, list: []string{"write", "read"}, scope: "-", want: "read write"},
+		{name: "empty scope in the default order", config: []func(*Config){twoDefaults}, list: []string{"admin", "write", "read"}, scope: " ", want: "read write"},
+		{name: "omitted scope with part of the defaults", config: []func(*Config){twoDefaults}, list: []string{"admin", "write"}, scope: "-", want: "write"},
+		{name: "omitted scope without a listed default", list: []string{"admin", "write"}, scope: "-", want: rejected},
+		{name: "named scope without a listed default", list: []string{"admin", "write"}, scope: "write admin", want: "write admin"},
+		{name: "list outside the configuration", list: []string{"other"}, scope: "-", want: rejected},
+		{name: "list outside the configuration with a known scope", list: []string{"other"}, scope: "read", want: rejected},
+		{name: "list outside the configuration with its own scope", list: []string{"other"}, scope: "other", want: rejected},
+		{name: "nil list", list: nil, scope: "-", want: rejected},
+		{name: "nil list with a scope", list: nil, scope: "read", want: rejected},
+		{name: "nil list with every scope", list: nil, scope: "read write admin", want: rejected},
+		{name: "empty list", list: []string{}, scope: "-", want: rejected},
+		{name: "empty list with a scope", list: []string{}, scope: "read", want: rejected},
+		{name: "empty list with every scope", list: []string{}, scope: "read write admin", want: rejected},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, tc.config...)
+			f.restrict(tc.list...)
+			params := authParams()
+			if tc.scope == "-" {
+				params.Del("scope")
+			} else {
+				params.Set("scope", tc.scope)
+			}
+			request, err := f.Authorize(t.Context(), params.Encode())
+			denied, errDeny := f.Deny(t.Context(), params.Encode())
+			if tc.want != rejected {
+				if err != nil || errDeny != nil || denied == "" || strings.Join(request.Scopes, " ") != tc.want {
+					t.Fatalf("request %+v, %v, deny %q, %v", request, err, denied, errDeny)
+				}
+				approved, redirect, err := f.Approve(t.Context(), params.Encode(), "user")
+				if err != nil || strings.Join(approved.Scopes, " ") != tc.want {
+					t.Fatalf("approved %+v, %v", approved, err)
+				}
+				u, err := url.Parse(redirect)
+				if err != nil {
+					t.Fatal(err)
+				}
+				record, _, err := f.store.MemoryStore.TakeCode(t.Context(), f.key("code", u.Query().Get("code")), f.now())
+				if err != nil || strings.Join(record.Scopes, " ") != tc.want {
+					t.Fatalf("record %+v, %v", record, err)
+				}
+				return
+			}
+			_, redirect, errApprove := f.Approve(t.Context(), params.Encode(), "user")
+			for name, err := range map[string]error{"authorize": err, "approve": errApprove, "deny": errDeny} {
+				var reject *RejectError
+				if !errors.As(err, &reject) || reject.Code != rejected || reject.Request.Scopes != nil ||
+					reject.Request.ClientID != "public" {
+					t.Fatalf("%s: error %v", name, err)
+				}
+				u, err := url.Parse(reject.RedirectURL)
+				if err != nil || u.Query().Get("error") != rejected || u.Query().Has("code") {
+					t.Fatalf("%s: redirect %q, %v", name, reject.RedirectURL, err)
+				}
+			}
+			if request.Scopes != nil || redirect != "" || denied != "" || f.store.total() != 0 {
+				t.Fatalf("request %+v, redirect %q %q, store calls %d", request, redirect, denied, f.store.total())
+			}
+		})
+	}
+
+	// A list on an unrestricted client is an invalid record, not a limit.
+	f := newFixture(t)
+	client := f.clients["public"]
+	client.Scopes = []string{"read"}
+	f.clients["public"] = client
+	_, err := f.Authorize(t.Context(), authParams().Encode())
+	var reject *RejectError
+	if !errors.Is(err, ErrRecord) || errors.Is(err, ErrInvalid) || errors.As(err, &reject) {
+		t.Fatalf("invalid scope list: %v", err)
+	}
+}

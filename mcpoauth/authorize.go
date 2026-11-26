@@ -15,8 +15,9 @@ type Request struct {
 	ClientName string
 	// RedirectURI is the presented value, unchanged.
 	RedirectURI string
-	// Scopes keeps the requested order without duplicates. It holds the
-	// configured default scopes when the request omitted scope.
+	// Scopes keeps the requested order without duplicates. When the request
+	// omitted scope it holds the configured default scopes that the client
+	// may be granted.
 	Scopes []string
 	State  string
 }
@@ -144,13 +145,21 @@ func (s *Server) authorize(ctx context.Context, rawQuery string) (*authorization
 		if scope == "" || slices.Contains(scopes, scope) {
 			continue
 		}
-		if _, ok := s.known[scope]; !ok {
+		if _, ok := s.known[scope]; !ok || !client.allows(scope) {
 			return reject("invalid_scope")
 		}
 		scopes = append(scopes, scope)
 	}
 	if len(scopes) == 0 {
-		scopes = slices.Clone(s.defaults)
+		for _, scope := range s.defaults {
+			if client.allows(scope) {
+				scopes = append(scopes, scope)
+			}
+		}
+		// A restricted client without a default scope must name its scopes.
+		if len(scopes) == 0 {
+			return reject("invalid_scope")
+		}
 	}
 	a.request.Scopes = scopes
 	return a, nil

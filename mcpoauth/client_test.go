@@ -18,12 +18,32 @@ func TestClientValidate(t *testing.T) {
 	for i := range many {
 		many[i] = fmt.Sprintf("https://client.example/cb/%d", i)
 	}
+	scopes := make([]string, 65)
+	for i := range scopes {
+		scopes[i] = fmt.Sprintf("scope:%d", i)
+	}
+	restrict := func(list ...string) func(*Client) {
+		return func(c *Client) { c.RestrictScopes, c.Scopes = true, list }
+	}
 	for _, tc := range []struct {
 		name   string
 		change func(*Client)
 		ok     bool
 	}{
 		{"minimal", func(*Client) {}, true},
+		{"unrestricted with an empty list", func(c *Client) { c.Scopes = []string{} }, true},
+		{"unrestricted with a list", func(c *Client) { c.Scopes = []string{"read"} }, false},
+		{"restricted without a list", restrict(), true},
+		{"restricted with an empty list", func(c *Client) { c.RestrictScopes, c.Scopes = true, []string{} }, true},
+		{"one scope", restrict("read"), true},
+		{"scope the server may not define", restrict("read", "undefined:scope"), true},
+		{"64 scopes", restrict(scopes[:64]...), true},
+		{"65 scopes", restrict(scopes...), false},
+		{"empty scope", restrict("read", ""), false},
+		{"scope with a space", restrict("read", "a b"), false},
+		{"scope with a quote", restrict(`a"b`), false},
+		{"long scope", restrict(strings.Repeat("x", 256)), false},
+		{"duplicate scope", restrict("read", "write", "read"), false},
 		{"empty name", func(c *Client) { c.Name = "" }, true},
 		{"longest ID", func(c *Client) { c.ID = strings.Repeat("x", 2048) }, true},
 		{"URL as ID", func(c *Client) { c.ID = "https://client.example/metadata.json" }, true},

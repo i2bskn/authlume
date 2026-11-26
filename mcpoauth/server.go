@@ -14,6 +14,22 @@
 // authorization code that is presented again before it expires revokes the
 // connection created from it in the same way.
 //
+// A client may be granted every scope of Config.Scopes unless its record sets
+// Client.RestrictScopes, which limits it to Client.Scopes. Set RestrictScopes
+// from the registration's own decision, not from whether the list is empty:
+// deriving it from the list's length turns an emptied list into full access.
+// An entry that Config.Scopes does not define is not reported as an error and
+// grants nothing. A restricted client whose list shares nothing with
+// Config.DefaultScopes must always send scope.
+//
+// Narrowing a client's list revokes each affected connection at its next
+// refresh. This is not reversible: restoring the list does not restore the
+// connection, so the ClientLookup must return a stable record. Removing a
+// scope from Config.Scopes, by contrast, narrows a connection and revokes it
+// only when no scope remains. Access tokens already issued keep their scope
+// until they expire or the connection is revoked. To cut access at once, the
+// application revokes the connections itself.
+//
 // Deviations and extensions that an integrator should know:
 //
 //   - redirect_uri is always required in an authorization request, even when

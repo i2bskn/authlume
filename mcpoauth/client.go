@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 )
 
@@ -22,6 +23,15 @@ type Client struct {
 	// Secret is nil for a public client. For a confidential client it is the
 	// SHA-256 digest of a random secret with at least 256 bits of entropy.
 	Secret *[sha256.Size]byte
+	// RestrictScopes limits the scopes this client may be granted to Scopes.
+	// When it is false the client may be granted every scope of Config.Scopes
+	// and Scopes must be empty. Narrowing the list revokes each affected
+	// connection at its next refresh.
+	RestrictScopes bool
+	// Scopes holds at most 64 distinct scope tokens and is used only with
+	// RestrictScopes. An empty list grants nothing. An entry that
+	// Config.Scopes does not define grants nothing.
+	Scopes []string
 }
 
 // ClientLookup resolves a client by its exact identifier. Return ErrNotFound
@@ -34,6 +44,7 @@ const (
 	maxClientName   = 255
 	maxRedirectURI  = 2048
 	maxRedirectURIs = 16
+	maxClientScopes = 64
 )
 
 // validClientID accepts 1 to 2048 bytes of printable ASCII without spaces.
@@ -49,6 +60,12 @@ func validClientID(id string) bool {
 	return true
 }
 
+// allows reports whether the client may be granted scope. It does not check
+// that the configuration defines the scope.
+func (c Client) allows(scope string) bool {
+	return !c.RestrictScopes || slices.Contains(c.Scopes, scope)
+}
+
 func loopback(host string) bool {
 	return host == "127.0.0.1" || host == "::1" || host == "localhost"
 }
@@ -60,6 +77,14 @@ func (c Client) Validate() error {
 	if !validClientID(c.ID) || len(c.Name) > maxClientName ||
 		len(c.RedirectURIs) == 0 || len(c.RedirectURIs) > maxRedirectURIs {
 		return ErrRecord
+	}
+	if len(c.Scopes) > maxClientScopes || (!c.RestrictScopes && len(c.Scopes) > 0) {
+		return ErrRecord
+	}
+	for i, scope := range c.Scopes {
+		if !scopeToken(scope) || slices.Contains(c.Scopes[:i], scope) {
+			return ErrRecord
+		}
 	}
 	for _, raw := range c.RedirectURIs {
 		u, err := url.Parse(raw)

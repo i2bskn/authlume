@@ -1127,3 +1127,173 @@ func TestDisconnect(t *testing.T) {
 	}
 	granted(t, f.refresh(sibling.refresh))
 }
+
+// TestExchangeClientScopes narrows the client's scope list between consent
+// and the code exchange.
+func TestExchangeClientScopes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		scope string
+		list  []string
+		want  string // empty when nothing remains
+	}{
+		{name: "every scope listed", scope: "read write", list: []string{"write", "read"}, want: "read write"},
+		{name: "one scope listed", scope: "read write", list: []string{"write"}, want: "write"},
+		{name: "the code's order is kept", scope: "write read admin", list: []string{"admin", "read"}, want: "read admin"},
+		{name: "reversed list", scope: "write admin read", list: []string{"read", "admin", "write"}, want: "write admin read"},
+		{name: "no scope listed", scope: "read write", list: []string{"admin"}},
+		{name: "list outside the configuration", scope: "read write", list: []string{"other"}},
+		{name: "nil list", scope: "read write", list: nil},
+		{name: "empty list", scope: "read write", list: []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			params := authParams()
+			params.Set("scope", tc.scope)
+			code := f.code(params, "user")
+			f.restrict(tc.list...)
+			r := post(t, f.Token, exchangeForm(code))
+			if tc.want == "" {
+				r.rejected(t, 400, "invalid_grant")
+				if errors.Is(r.err, ErrReused) || r.event.ConnectionID != "" || r.event.Subject != "" ||
+					f.store.calls["Create"] != 0 || len(f.connections("user")) != 0 {
+					t.Fatalf("err %v, event %+v, creations %d", r.err, r.event, f.store.calls["Create"])
+				}
+				// The code stays consumed after the list is restored.
+				f.restrict("read", "write", "admin")
+				again := post(t, f.Token, exchangeForm(code))
+				again.rejected(t, 400, "invalid_grant")
+				if again.err != ErrReused {
+					t.Fatalf("second exchange: %v", again.err)
+				}
+				return
+			}
+			g := granted(t, r)
+			access, err := f.Verify(bearer(g.access))
+			conn, errStored := f.stored(g.refresh)
+			if r.field("scope") != tc.want || err != nil || strings.Join(access.Scopes, " ") != tc.want ||
+				errStored != nil || strings.Join(conn.Scopes, " ") != tc.want {
+				t.Fatalf("scope %q, access %+v, %v, stored %v, %v", r.field("scope"), access, err, conn.Scopes, errStored)
+			}
+			// The narrowed connection is within the list, so it refreshes.
+			if next := f.refresh(g.refresh); granted(t, next).id != g.id || next.field("scope") != tc.want {
+				t.Fatalf("refreshed scope %q", next.field("scope"))
+			}
+		})
+	}
+}
+
+// TestRefreshClientScopes changes the client's scope list after a connection
+// with the scopes read and write was created.
+func TestRefreshClientScopes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		list []string
+	}{
+		{"one scope removed", []string{"read"}},
+		{"other scope removed", []string{"admin", "write"}},
+		{"every scope removed", []string{"admin"}},
+		{"list outside the configuration", []string{"other"}},
+		{"nil list", nil},
+		{"empty list", []string{}},
+	} {
+		t.Run("revoked/"+tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			g, sibling := f.connect("user"), f.connect("other")
+			unrestricted := f.clients["public"]
+			f.restrict(tc.list...)
+			r := f.refresh(g.refresh)
+			r.rejected(t, 400, "invalid_grant")
+			if _, err := f.stored(g.refresh); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("a connection beyond the client's scopes survived: %v", err)
+			}
+			if want := (Event{Grant: "refresh_token", ClientID: "public", ConnectionID: g.id, Subject: "user"}); r.event != want ||
+				errors.Is(r.err, ErrReused) || f.store.calls["Revoke"] != 1 {
+				t.Fatalf("err %v, event %+v, revocations %d", r.err, r.event, f.store.calls["Revoke"])
+			}
+			if f.valid(g.access) || len(f.connections("user")) != 0 {
+				t.Fatal("the access token survived")
+			}
+			// Restoring the list does not restore the connection.
+			f.clients["public"] = unrestricted
+			again := f.refresh(g.refresh)
+			again.rejected(t, 400, "invalid_grant")
+			if errors.Is(again.err, ErrReused) || again.event.ConnectionID != "" {
+				t.Fatalf("refresh after restoring the list: err %v, event %+v", again.err, again.event)
+			}
+			// Another user's connection of the same client is judged on its own
+			// refresh, with the list of that moment.
+			if !f.valid(sibling.access) {
+				t.Fatal("another connection was revoked")
+			}
+			granted(t, f.refresh(sibling.refresh))
+		})
+	}
+
+	for _, tc := range []struct {
+		name  string
+		list  []string
+		scope string
+	}{
+		{"exact list", []string{"read", "write"}, ""},
+		{"reversed wider list", []string{"admin", "write", "read"}, ""},
+		{"requested scope outside the list", []string{"write", "read"}, "admin"},
+		{"requested scopes inside and outside the list", []string{"write", "read"}, "read admin"},
+	} {
+		t.Run("kept/"+tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			g := f.connect("user")
+			f.restrict(tc.list...)
+			form := refreshForm(g.refresh)
+			if tc.scope != "" {
+				form.Set("scope", tc.scope)
+			}
+			r := post(t, f.Token, form)
+			next := granted(t, r)
+			access, err := f.Verify(bearer(next.access))
+			if next.id != g.id || r.field("scope") != "read write" || err != nil || strings.Join(access.Scopes, " ") != "read write" ||
+				f.store.calls["Revoke"] != 0 {
+				t.Fatalf("scope %q, access %+v, %v", r.field("scope"), access, err)
+			}
+		})
+	}
+
+	t.Run("revocation failure", func(t *testing.T) {
+		f := newFixture(t)
+		g := f.connect("user")
+		f.restrict("read")
+		down := errors.New("backend down")
+		f.store.fail["Revoke"] = down
+		r := f.refresh(g.refresh)
+		r.unavailable(t, down)
+		if !strings.HasPrefix(r.err.Error(), "mcpoauth: revoke connection: ") || r.event.ConnectionID != g.id || r.event.Subject != "user" {
+			t.Fatalf("err %v, event %+v", r.err, r.event)
+		}
+	})
+}
+
+// A scope list on a client that does not restrict scopes is an invalid record
+// at every endpoint that resolves the client.
+func TestClientScopesInvalidRecord(t *testing.T) {
+	f := newFixture(t)
+	g := f.connect("user")
+	code := f.code(authParams(), "user")
+	client := f.clients["public"]
+	client.Scopes = []string{"read", "write"}
+	f.clients["public"] = client
+	for _, token := range []string{g.access, g.refresh} {
+		r := post(t, f.Revocation, url.Values{"client_id": {"public"}, "token": {token}})
+		r.unavailable(t, ErrRecord)
+		if r.event != (Event{}) {
+			t.Fatalf("event %+v", r.event)
+		}
+	}
+	f.refresh(g.refresh).unavailable(t, ErrRecord)
+	post(t, f.Token, exchangeForm(code)).unavailable(t, ErrRecord)
+	if f.store.calls["Revoke"] != 0 || f.store.calls["Rotate"] != 0 || f.store.calls["TakeCode"] != 1 || !f.valid(g.access) {
+		t.Fatalf("an invalid client record reached the store: %v", f.store.calls)
+	}
+	// The same list is valid once the record restricts scopes.
+	f.restrict("read", "write")
+	granted(t, f.refresh(g.refresh))
+}

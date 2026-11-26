@@ -13,6 +13,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 )
@@ -253,7 +254,9 @@ func (s *Server) exchange(ctx context.Context, client Client, values url.Values,
 	if record.Subject == "" || len(record.Scopes) == 0 {
 		return nil, unavailable(ErrRecord)
 	}
-	scopes := s.granted(record.Scopes)
+	// A scope the client may no longer be granted is dropped like one the
+	// configuration no longer defines.
+	scopes := slices.DeleteFunc(s.granted(record.Scopes), func(scope string) bool { return !client.allows(scope) })
 	if len(scopes) == 0 || record.ClientID != client.ID {
 		return nil, badRequest("invalid_grant")
 	}
@@ -299,7 +302,8 @@ func (s *Server) exchange(ctx context.Context, client Client, values url.Values,
 }
 
 // refresh rotates a connection's tokens. The issued scope is always that of
-// the connection; a requested scope is only checked for known values.
+// the connection; a requested scope is only checked for known values. A
+// connection holding a scope the client may no longer be granted is revoked.
 func (s *Server) refresh(ctx context.Context, client Client, values url.Values, event *Event) ([]byte, *failure) {
 	token := values.Get("refresh_token")
 	if token == "" {
@@ -345,9 +349,13 @@ func (s *Server) refresh(ctx context.Context, client Client, values url.Values, 
 	}
 	event.ConnectionID, event.Subject = conn.ID, conn.Subject
 	scopes := s.granted(conn.Scopes)
-	// A connection without a remaining scope, or one the store rotated past
-	// its absolute deadline, must not keep working tokens.
-	if len(scopes) == 0 || conn.absoluteExpired(now) {
+	// A connection without a remaining scope, one holding a scope its client
+	// may no longer be granted, or one the store rotated past its absolute
+	// deadline, must not keep working tokens. A scope outside the client's
+	// list is not dropped silently: the stored scope, which Verify reports,
+	// would then differ from the issued one.
+	if len(scopes) == 0 || conn.absoluteExpired(now) ||
+		slices.ContainsFunc(scopes, func(scope string) bool { return !client.allows(scope) }) {
 		if err := s.store.Revoke(ctx, conn.ID); err != nil {
 			return nil, unavailable(fmt.Errorf("mcpoauth: revoke connection: %w", err))
 		}

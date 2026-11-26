@@ -271,3 +271,100 @@ func TestMissingLookup(t *testing.T) {
 		t.Fatal("expected configuration error")
 	}
 }
+
+func TestMigrationAcceptance(t *testing.T) {
+	fromPBKDF2 := []password.Option{password.WithMigrationFrom(password.PBKDF2SHA256)}
+	fromArgon2id := []password.Option{
+		password.WithAlgorithm(password.PBKDF2SHA256), password.WithMigrationFrom(password.Argon2id),
+	}
+	for _, tc := range []struct {
+		name     string
+		opts     []password.Option
+		record   string
+		secret   string
+		decision password.Decision
+		want     error
+		rehash   bool
+	}{
+		{"argon2id primary, argon2id record", fromPBKDF2, argon2Record, fixturePassword, password.PasswordOnly, nil, false},
+		{"argon2id primary, argon2id record, wrong password", fromPBKDF2, argon2Record, "different password", 0, password.ErrCredentials, false},
+		{"argon2id primary, pbkdf2 record", fromPBKDF2, fixtureRecord, fixturePassword, password.PasswordOnly, nil, true},
+		{"argon2id primary, pbkdf2 record, require mfa", fromPBKDF2, fixtureRecord, fixturePassword, password.RequireMFA, nil, true},
+		{"argon2id primary, pbkdf2 record, wrong password", fromPBKDF2, fixtureRecord, "different password", 0, password.ErrCredentials, false},
+		{"pbkdf2 primary, argon2id record", fromArgon2id, argon2Record, fixturePassword, password.PasswordOnly, nil, true},
+		{"pbkdf2 primary, argon2id record, wrong password", fromArgon2id, argon2Record, "different password", 0, password.ErrCredentials, false},
+		{"pbkdf2 primary, pbkdf2 record", fromArgon2id, fixtureRecord, fixturePassword, password.PasswordOnly, nil, false},
+		{"pbkdf2 primary, pbkdf2 record, wrong password", fromArgon2id, fixtureRecord, "different password", 0, password.ErrCredentials, false},
+		{"broken record", fromPBKDF2, "malformed", fixturePassword, 0, password.ErrRecord, false},
+		{"broken record, wrong password", fromPBKDF2, "malformed", "different password", 0, password.ErrRecord, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := authenticator(t, credential(tc.record), func(context.Context, string) (password.Decision, error) {
+				if tc.want != nil {
+					t.Fatal("policy ran after failed verification")
+				}
+				return tc.decision, nil
+			}, tc.opts...)
+			result, err := auth.Authenticate(t.Context(), "id", tc.secret)
+			want := password.Result{}
+			if tc.want == nil {
+				want = password.Result{Subject: "demo-subject", Decision: tc.decision, Rehash: tc.rehash}
+			}
+			if result != want || !errors.Is(err, tc.want) {
+				t.Fatalf("result %+v, err %v, want %+v, %v", result, err, want, tc.want)
+			}
+		})
+	}
+}
+
+func TestMigrationRoundTrip(t *testing.T) {
+	record := fixtureRecord
+	auth := authenticator(t, func(context.Context, string) (password.Credential, error) {
+		return password.Credential{Subject: "demo-subject", Hash: record}, nil
+	}, nil, password.WithMigrationFrom(password.PBKDF2SHA256))
+	result, err := auth.Authenticate(t.Context(), "id", fixturePassword)
+	if err != nil || !result.Rehash || !auth.NeedsRehash(record) {
+		t.Fatalf("old record: result %+v, err %v, NeedsRehash %v", result, err, auth.NeedsRehash(record))
+	}
+	replacement, err := auth.Hash(fixturePassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(replacement, "v2$argon2id$m=19456,t=2,p=1$") {
+		t.Fatalf("Hash used a different format: %q", replacement)
+	}
+	record = replacement
+	result, err = auth.Authenticate(t.Context(), "id", fixturePassword)
+	want := password.Result{Subject: "demo-subject", Decision: password.PasswordOnly}
+	if err != nil || result != want || auth.NeedsRehash(record) {
+		t.Fatalf("new record: result %+v, err %v, NeedsRehash %v", result, err, auth.NeedsRehash(record))
+	}
+}
+
+func TestNeedsRehash(t *testing.T) {
+	records := []string{argon2Record, fixtureRecord, "malformed", ""}
+	for _, tc := range []struct {
+		name string
+		opts []password.Option
+		want string // the only record that needs a rehash, if any
+	}{
+		{"no migration", nil, ""},
+		{"argon2id primary", []password.Option{password.WithMigrationFrom(password.PBKDF2SHA256)}, fixtureRecord},
+		{"pbkdf2 primary", []password.Option{
+			password.WithAlgorithm(password.PBKDF2SHA256), password.WithMigrationFrom(password.Argon2id),
+		}, argon2Record},
+	} {
+		auth := authenticator(t, credential(argon2Record), nil, tc.opts...)
+		for _, record := range records {
+			if got, want := auth.NeedsRehash(record), record != "" && record == tc.want; got != want {
+				t.Fatalf("%s: NeedsRehash(%q) = %v, want %v", tc.name, record, got, want)
+			}
+		}
+	}
+	var missing *password.Authenticator
+	for _, record := range records {
+		if missing.NeedsRehash(record) || (&password.Authenticator{}).NeedsRehash(record) {
+			t.Fatalf("NeedsRehash(%q) is true without configuration", record)
+		}
+	}
+}

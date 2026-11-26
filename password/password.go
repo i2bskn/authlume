@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"golang.org/x/crypto/argon2"
@@ -74,17 +75,80 @@ func (alg Algorithm) prefix() string {
 
 type config struct {
 	algorithm Algorithm
+	migration []Algorithm
 }
 
 // Option configures an Authenticator.
 type Option func(*config)
 
-// WithAlgorithm selects the algorithm used by the Authenticator for new records
-// from its Hash method, for the only record format accepted by Authenticate,
-// and for the dummy work spent on unknown identifiers and invalid records.
-// The package-level Hash function ignores this setting and always uses Argon2id.
+// WithAlgorithm selects the primary algorithm of the Authenticator. It is used
+// for new records from its Hash method, for the record format accepted by
+// Authenticate, and for the dummy work spent on unknown identifiers and invalid
+// records. Authenticate accepts no other format unless WithMigrationFrom names
+// it. The package-level Hash function ignores this setting and always uses
+// Argon2id.
 func WithAlgorithm(alg Algorithm) Option {
 	return func(c *config) { c.algorithm = alg }
+}
+
+// WithMigrationFrom makes Authenticate also accept records of the given
+// algorithms. New records still use the algorithm selected with WithAlgorithm.
+// A successful Authenticate for such a record sets Result.Rehash.
+//
+// The given algorithms must be supported, distinct and different from the
+// algorithm selected with WithAlgorithm. The arguments are copied when
+// WithMigrationFrom is called. A call without arguments accepts no additional
+// algorithm.
+//
+// While the option is set, every Authenticate call that reaches a derivation
+// performs one derivation per accepted algorithm: the real one for the
+// algorithm of the stored record and a dummy one for each of the others, or
+// only dummy ones for an unknown identifier or an invalid record. The response
+// time of Authenticate therefore does not depend on whether the identifier
+// exists or which accepted algorithm its record uses. In exchange every attempt
+// costs the sum of the accepted algorithms, for example one Argon2id and one
+// PBKDF2 derivation, and login throttling must allow for the added cost while
+// the option is set.
+//
+// When Result.Rehash is true, replace the stored record. First compute the new
+// record with the Authenticator's Hash method from the password that was just
+// verified; the package-level Hash always writes Argon2id. Then, holding a lock
+// on the stored record (a row lock, or the store's conditional write), read it
+// again and write the new record only if NeedsRehash is still true for the
+// stored one. Without the lock a concurrent password change can still be
+// overwritten with the old password. Do the replacement synchronously. It may
+// happen as soon as the password is verified, before MFA completes, because it
+// only re-encodes the same password. A failed replacement need not fail the
+// login: the old record still verifies and the next sign-in tries again. The
+// replacement is the application's own work and adds time to a successful
+// sign-in of a migrating record.
+//
+// NeedsRehash tells formats apart, not records. The check protects a concurrent
+// password change only when that change wrote a record of the primary
+// algorithm. Every writer of password records must therefore use the Hash
+// method of an Authenticator with the same configuration. A writer that still
+// produces the other algorithm, such as an instance not yet switched during a
+// rollout or a tool calling the package-level Hash while the primary algorithm
+// is PBKDF2, is not protected. An application that needs the stronger guarantee
+// keeps the record its Lookup returned and writes only if the stored record
+// still equals it.
+//
+// An instance without the option rejects records of the other algorithm. To
+// roll out across several instances, first deploy every instance with the old
+// algorithm as primary and the new one in WithMigrationFrom, then swap the two.
+// To roll back, return to the first step. During the swap, instances on either
+// side re-encode records toward their own primary algorithm, so a record can
+// move back and forth until every instance is switched. Authentication keeps
+// working throughout.
+//
+// Records of users who never sign in stay unmigrated and return ErrRecord once
+// the option is removed. Before removing it, count them by calling NeedsRehash
+// for each record, or by matching the record prefixes documented in
+// docs/phase-one.md in a query, and decide what happens to them, for example a
+// forced password reset.
+func WithMigrationFrom(algs ...Algorithm) Option {
+	migration := slices.Clone(algs)
+	return func(c *config) { c.migration = migration }
 }
 
 // Credential contains the stable application subject and its encoded password hash.
@@ -113,6 +177,10 @@ type Policy func(ctx context.Context, subject string) (Decision, error)
 type Result struct {
 	Subject  string
 	Decision Decision
+	// Rehash reports that the verified record uses an algorithm accepted only
+	// through WithMigrationFrom. Replace the record with the Authenticator's
+	// Hash of the password that was just verified.
+	Rehash bool
 }
 
 // Authenticator verifies credentials and applies the configured login policy.
@@ -120,12 +188,15 @@ type Authenticator struct {
 	lookup    Lookup
 	policy    Policy
 	algorithm Algorithm
+	migration []Algorithm
 }
 
 // New constructs an authenticator. A nil policy selects PasswordOnly.
 // Applications requiring additional factors must supply their policy here.
-// Without options the authenticator uses Argon2id. When the same option is
-// given more than once, the last one wins.
+// Without options the authenticator uses Argon2id and accepts no other
+// algorithm. When the same option is given more than once, the last one wins.
+// The options are checked together after all of them are applied, so their
+// order does not matter.
 func New(lookup Lookup, policy Policy, opts ...Option) (*Authenticator, error) {
 	if lookup == nil {
 		return nil, errConfiguration
@@ -142,10 +213,25 @@ func New(lookup Lookup, policy Policy, opts ...Option) (*Authenticator, error) {
 	if !cfg.algorithm.valid() {
 		return nil, errAlgorithm
 	}
+	for _, alg := range cfg.migration {
+		if !alg.valid() {
+			return nil, errAlgorithm
+		}
+	}
+	for i, alg := range cfg.migration {
+		if alg == cfg.algorithm || slices.Contains(cfg.migration[:i], alg) {
+			return nil, errOption
+		}
+	}
 	if policy == nil {
 		policy = func(context.Context, string) (Decision, error) { return PasswordOnly, nil }
 	}
-	return &Authenticator{lookup: lookup, policy: policy, algorithm: cfg.algorithm}, nil
+	return &Authenticator{
+		lookup:    lookup,
+		policy:    policy,
+		algorithm: cfg.algorithm,
+		migration: slices.Clone(cfg.migration),
+	}, nil
 }
 
 // Hash encodes a new record with the authenticator's configured algorithm and
@@ -196,17 +282,77 @@ func derive(alg Algorithm, secret string, salt []byte) ([]byte, error) {
 	}
 }
 
-// dummyDerive spends the same KDF cost as an ordinary verification without
-// using any value from the stored record.
+// NeedsRehash reports whether record is a well-formed record of an algorithm
+// accepted only through WithMigrationFrom. It performs no derivation.
+func (a *Authenticator) NeedsRehash(record string) bool {
+	if a == nil {
+		return false
+	}
+	for _, alg := range a.migration {
+		if _, _, err := parseRecord(alg, record); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// accepted returns the configured algorithm followed by the algorithms from
+// WithMigrationFrom in their given order.
+func (a *Authenticator) accepted() []Algorithm {
+	algs := make([]Algorithm, 0, 1+len(a.migration))
+	return append(append(algs, a.algorithm), a.migration...)
+}
+
+// deriveAll performs one derivation per accepted algorithm, in the order of
+// accepted. It returns the key derived with salt for the algorithm equal to
+// record. Every other derivation is dummy work with a zero salt whose result is
+// discarded. With record 0 all derivations are dummy work and the key is nil.
+func (a *Authenticator) deriveAll(secret string, record Algorithm, salt []byte) ([]byte, error) {
+	var actual []byte
+	dummy := make([]byte, saltSize)
+	for _, alg := range a.accepted() {
+		if alg != record {
+			if _, err := deriveKey(alg, secret, dummy); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		key, err := deriveKey(alg, secret, salt)
+		if err != nil {
+			return nil, err
+		}
+		actual = key
+	}
+	return actual, nil
+}
+
+// dummyDerive spends the same KDF cost as an ordinary verification, one
+// derivation per accepted algorithm, without using any value from the stored
+// record.
 func (a *Authenticator) dummyDerive(secret string) error {
-	_, err := deriveKey(a.algorithm, secret, make([]byte, saltSize))
+	_, err := a.deriveAll(secret, 0, nil)
 	return err
 }
 
-// Authenticate verifies the password before evaluating policy. It accepts only
-// records in the format of the configured algorithm; any other record returns
-// ErrRecord. Lookup and policy errors are for internal handling and may contain
-// application details.
+// parse returns the accepted algorithm whose exact format record has, with the
+// decoded salt and key. The configured algorithm is tried first, then the
+// algorithms from WithMigrationFrom. The record prefixes differ, so at most one
+// algorithm matches.
+func (a *Authenticator) parse(record string) (alg Algorithm, salt, key []byte, err error) {
+	for _, alg := range a.accepted() {
+		if salt, key, err := parseRecord(alg, record); err == nil {
+			return alg, salt, key, nil
+		}
+	}
+	return 0, nil, nil, ErrRecord
+}
+
+// Authenticate verifies the password before evaluating policy. It accepts
+// records in the format of the configured algorithm and, when WithMigrationFrom
+// is set, of the algorithms named there; any other record returns ErrRecord. A
+// success for a record accepted only through WithMigrationFrom sets
+// Result.Rehash. Authenticate never changes the stored record. Lookup and policy
+// errors are for internal handling and may contain application details.
 func (a *Authenticator) Authenticate(ctx context.Context, identifier, secret string) (Result, error) {
 	if a == nil || a.lookup == nil || a.policy == nil {
 		return Result{}, errConfiguration
@@ -222,7 +368,8 @@ func (a *Authenticator) Authenticate(ctx context.Context, identifier, secret str
 	}
 	cred, err := a.lookup(ctx, identifier)
 	if errors.Is(err, ErrNotFound) {
-		// Spend the same KDF cost as an ordinary unsuccessful verification.
+		// Spend the same KDF cost as an ordinary unsuccessful verification:
+		// one derivation per accepted algorithm.
 		if err := a.dummyDerive(secret); err != nil {
 			return Result{}, err
 		}
@@ -231,7 +378,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, identifier, secret str
 	if err != nil {
 		return Result{}, fmt.Errorf("password: lookup: %w", err)
 	}
-	salt, expected, err := parseRecord(a.algorithm, cred.Hash)
+	alg, salt, expected, err := a.parse(cred.Hash)
 	if err != nil || cred.Subject == "" {
 		// Keep invalid records indistinguishable in timing from unknown identifiers.
 		if err := a.dummyDerive(secret); err != nil {
@@ -239,7 +386,9 @@ func (a *Authenticator) Authenticate(ctx context.Context, identifier, secret str
 		}
 		return Result{}, ErrRecord
 	}
-	actual, err := deriveKey(a.algorithm, secret, salt)
+	// Only the derivation for the record's algorithm is compared. The dummy
+	// derivations for the other accepted algorithms keep the work equal.
+	actual, err := a.deriveAll(secret, alg, salt)
 	if err != nil {
 		return Result{}, err
 	}
@@ -256,7 +405,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, identifier, secret str
 	if decision != PasswordOnly && decision != RequireMFA {
 		return Result{}, errors.New("password: invalid policy decision")
 	}
-	return Result{Subject: cred.Subject, Decision: decision}, nil
+	return Result{Subject: cred.Subject, Decision: decision, Rehash: alg != a.algorithm}, nil
 }
 
 // parseRecord accepts only the exact format of alg. Parameters are never read

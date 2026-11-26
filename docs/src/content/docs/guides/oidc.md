@@ -82,6 +82,33 @@ if a.ACR == acceptedACR && time.Since(a.AuthTime) < 5*time.Minute {
 
 The presence of a claim proves nothing by itself. Check the signed value against what this exact issuer documents for it. Only the branch that satisfies the policy calls `sessions.Issue`.
 
+## Read other claims
+
+List additional scopes in `Config.Scopes` and read the claims of the verified ID token from `identity.Claims`. `openid` is always requested and is not listed.
+
+```go
+client, err := oidc.New(ctx, oidc.Config{
+	// ...
+	Scopes: []string{"email"},
+}, store)
+
+// After a successful Complete:
+email, ok := identity.Claims.Text("email")
+verified, isBool := identity.Claims.Bool("email_verified")
+if !ok || !isBool || !verified {
+	// This issuer did not assert a verified address. Decline, or fall back to
+	// the application's own verification.
+}
+```
+
+- `Text` and `Bool` return a value only when the claim has that JSON type. The string `"true"` is not true. Check both results of `Bool`.
+- Read any other claim from `identity.Claims[name]` with `json.Unmarshal`. Decoding into a struct folds the case of field names and lets `null` through, so decode a single value, not the whole map into a struct.
+- Claims come from the ID token only. The package does not call the UserInfo endpoint, so a provider that returns a claim only there does not supply it. It does not send the `claims` request parameter.
+- Scopes only change what the ID token contains. The access token is discarded, `offline_access` is refused, and the list is not compared with the provider's metadata: a scope the provider rejects makes every login fail with `oidc.ErrInvalid`.
+- What a claim means depends on the issuer. Check what this exact issuer guarantees for `email_verified`, and read issuer-specific claims such as Google's `hd` the same way.
+- The rule in [Link the identity to an account](#link-the-identity-to-an-account) is unchanged: a matching address never links an identity to an existing account. Use claims to decide whether to accept an unknown issuer and subject pair, at the first sign-in. On later sign-ins the account is found by issuer and subject alone.
+- Claims can contain personal data. `Claims` prints as a count in logs, but read the claims you need and do not store or serialize the whole map.
+
 ## Ask the provider for more
 
 `BeginWithOptions` sends constraints chosen by trusted application policy.

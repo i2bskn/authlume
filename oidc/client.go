@@ -7,9 +7,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,11 +34,52 @@ type Assurance struct {
 	AuthTime time.Time
 }
 
-// Identity contains a verified external identifier and the provider’s signed assurance.
+// Identity contains a verified external identifier, the provider's signed
+// assurance and the claims of the verified ID token.
 type Identity struct {
 	ID        ExternalID
 	Assurance Assurance
+	// Claims holds every claim of the verified ID token, including protocol
+	// claims and those this package has already checked. They are the
+	// provider's assertions: decide per issuer which ones to trust. They can
+	// contain personal data, so read the claims you need and do not log or
+	// store the whole map.
+	Claims Claims
 }
+
+// Claims holds the claims of a verified ID token, keyed by their exact,
+// case-sensitive names. Each value is the claim's raw JSON.
+type Claims map[string]json.RawMessage
+
+// Text returns the claim's value when it is a JSON string.
+func (c Claims) Text(name string) (string, bool) {
+	var value *string
+	if raw, ok := c[name]; !ok || json.Unmarshal(raw, &value) != nil || value == nil {
+		return "", false
+	}
+	return *value, true
+}
+
+// Bool returns the claim's value when it is a JSON boolean.
+func (c Claims) Bool(name string) (value, ok bool) {
+	var parsed *bool
+	if raw, found := c[name]; !found || json.Unmarshal(raw, &parsed) != nil || parsed == nil {
+		return false, false
+	}
+	return *parsed, true
+}
+
+// String, GoString and LogValue report only the number of claims, so that
+// logging an Identity does not write personal data.
+func (c Claims) String() string {
+	return "oidc.Claims(" + strconv.Itoa(len(c)) + " claims)"
+}
+
+// GoString returns the same text as String.
+func (c Claims) GoString() string { return c.String() }
+
+// LogValue returns the same text as String.
+func (c Claims) LogValue() slog.Value { return slog.StringValue(c.String()) }
 
 // Config is trusted application configuration for one confidential client.
 // RedirectURL must be a dedicated HTTPS callback with no query string. Use a
@@ -50,6 +93,10 @@ type Config struct {
 	// it is empty only RS256 is accepted. An ID token signed with any other
 	// algorithm is rejected, including RS256 when the list omits it.
 	SigningAlgs []SigningAlg
+	// Scopes lists scopes to request in addition to openid, such as "email".
+	// openid is always requested and must not be listed. offline_access is
+	// refused, because only the ID token is kept.
+	Scopes []string
 }
 
 // SigningAlg names a JWS signature algorithm for ID tokens.
@@ -83,6 +130,43 @@ func signingAlgs(list []SigningAlg) ([]string, bool) {
 	return algs, true
 }
 
+const (
+	maxScopes      = 32
+	maxScopeLength = 255
+)
+
+// scopeToken reports whether s is a scope token: one or more printable ASCII
+// bytes other than space, double quote and backslash.
+func scopeToken(s string) bool {
+	if s == "" || len(s) > maxScopeLength {
+		return false
+	}
+	for i := range len(s) {
+		if b := s[i]; b < 0x21 || b > 0x7e || b == '"' || b == '\\' {
+			return false
+		}
+	}
+	return true
+}
+
+// requestedScopes returns openid followed by a private copy of the additional
+// scopes. It reports false for a malformed, reserved or repeated entry, or
+// for too many entries.
+func requestedScopes(list []string) ([]string, bool) {
+	if len(list) > maxScopes {
+		return nil, false
+	}
+	scopes := make([]string, 1, 1+len(list))
+	scopes[0] = provider.ScopeOpenID
+	for _, scope := range list {
+		if !scopeToken(scope) || scope == provider.ScopeOfflineAccess || slices.Contains(scopes, scope) {
+			return nil, false
+		}
+		scopes = append(scopes, scope)
+	}
+	return scopes, true
+}
+
 // Client manages browser logins for one configured issuer and client registration.
 type Client struct {
 	issuer                string
@@ -104,8 +188,9 @@ func httpsURL(raw string, allowQuery bool) bool {
 // New discovers a fixed provider over HTTPS. Reuse the client across requests.
 func New(ctx context.Context, cfg Config, store Store) (*Client, error) {
 	algs, ok := signingAlgs(cfg.SigningAlgs)
+	scopes, scopesOK := requestedScopes(cfg.Scopes)
 	if store == nil || !httpsURL(cfg.Issuer, false) || !httpsURL(cfg.RedirectURL, false) ||
-		cfg.ClientID == "" || cfg.ClientSecret == "" || !ok {
+		cfg.ClientID == "" || cfg.ClientSecret == "" || !ok || !scopesOK {
 		return nil, errors.New("oidc: invalid client configuration")
 	}
 	transport := cfg.Transport
@@ -140,7 +225,7 @@ func New(ctx context.Context, cfg Config, store Store) (*Client, error) {
 		cookieName: "__Host-authlume-oidc-" + base64.RawURLEncoding.EncodeToString(sum[:]),
 		oauth: oauth2.Config{
 			ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret, RedirectURL: cfg.RedirectURL,
-			Endpoint: endpoint, Scopes: []string{provider.ScopeOpenID},
+			Endpoint: endpoint, Scopes: scopes,
 		},
 		// Discovery honors ctx; the shared key cache outlives initialization.
 		keys: provider.NewRemoteKeySet(provider.ClientContext(context.Background(), hc), meta.JWKSURL),
@@ -318,5 +403,6 @@ func (c *Client) identity(token *provider.IDToken, nonce string, now time.Time) 
 			return Identity{}, ErrInvalid
 		}
 	}
+	id.Claims = claims
 	return id, nil
 }

@@ -1,6 +1,7 @@
 package oidc
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -14,6 +15,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -502,5 +505,408 @@ func TestInvalidSigningAlgs(t *testing.T) {
 		if transport.calls.Load() != 0 {
 			t.Errorf("algorithms %q: contacted the provider", algs)
 		}
+	}
+}
+
+func TestClaimsAccessors(t *testing.T) {
+	claims := Claims{
+		"null":           json.RawMessage(`null`),
+		"padded null":    json.RawMessage(" null\n"),
+		"text":           json.RawMessage(`"user@example.com"`),
+		"padded text":    json.RawMessage(` "padded" `),
+		"untrimmed":      json.RawMessage(`" Mixed Caseé "`),
+		"empty text":     json.RawMessage(`""`),
+		"true":           json.RawMessage(`true`),
+		"false":          json.RawMessage(`false`),
+		"padded true":    json.RawMessage("\ttrue "),
+		"quoted true":    json.RawMessage(`"true"`),
+		"one":            json.RawMessage(`1`),
+		"object":         json.RawMessage(`{"a":true}`),
+		"array":          json.RawMessage(`["a"]`),
+		"empty raw":      json.RawMessage(``),
+		"malformed":      json.RawMessage(`tru`),
+		"Email_Verified": json.RawMessage(`true`),
+		"Email":          json.RawMessage(`"user@example.com"`),
+	}
+	for _, tt := range []struct {
+		name            string
+		text            string
+		isText          bool
+		value, isBool   bool
+		fromNilClaimSet bool
+	}{
+		{name: "absent"},
+		{name: "null"},
+		{name: "padded null"},
+		{name: "text", text: "user@example.com", isText: true},
+		{name: "padded text", text: "padded", isText: true},
+		{name: "untrimmed", text: " Mixed Caseé ", isText: true},
+		{name: "empty text", isText: true},
+		{name: "true", value: true, isBool: true},
+		{name: "false", isBool: true},
+		{name: "padded true", value: true, isBool: true},
+		{name: "quoted true", text: "true", isText: true},
+		{name: "one"},
+		{name: "object"},
+		{name: "array"},
+		{name: "empty raw"},
+		{name: "malformed"},
+		{name: "email_verified"},
+		{name: "email"},
+		{name: "Email_Verified", value: true, isBool: true},
+		{name: "text", fromNilClaimSet: true},
+		{name: "true", fromNilClaimSet: true},
+	} {
+		c := claims
+		if tt.fromNilClaimSet {
+			c = nil
+		}
+		if text, ok := c.Text(tt.name); text != tt.text || ok != tt.isText {
+			t.Errorf("Text(%q) nil=%v: got %q, %v", tt.name, tt.fromNilClaimSet, text, ok)
+		}
+		if value, ok := c.Bool(tt.name); value != tt.value || ok != tt.isBool {
+			t.Errorf("Bool(%q) nil=%v: got %v, %v", tt.name, tt.fromNilClaimSet, value, ok)
+		}
+	}
+}
+
+func TestClaimsAreNotLogged(t *testing.T) {
+	const address = "user@example.com"
+	identity := Identity{
+		ID:     ExternalID{Issuer: "https://id.example", Subject: "subject"},
+		Claims: Claims{"email": json.RawMessage(`"` + address + `"`), "sub": json.RawMessage(`"subject"`)},
+	}
+	const want = "oidc.Claims(2 claims)"
+	for _, verb := range []string{"%v", "%+v", "%s", "%#v"} {
+		for _, value := range []any{identity, &identity, identity.Claims} {
+			if out := fmt.Sprintf(verb, value); strings.Contains(out, address) || !strings.Contains(out, want) {
+				t.Errorf("%s of %T: got %s", verb, value, out)
+			}
+		}
+	}
+	var out bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&out, nil))
+	logger.Info("login", "identity", identity, "pointer", &identity, "claims", identity.Claims)
+	logger.Info("login", slog.Any("claims", identity.Claims), slog.Group("group", slog.Any("identity", identity)))
+	if strings.Contains(out.String(), address) || strings.Count(out.String(), want) != 5 {
+		t.Errorf("slog: got %s", out.String())
+	}
+	if got := (Claims)(nil).String(); got != "oidc.Claims(0 claims)" {
+		t.Errorf("nil claims: got %s", got)
+	}
+}
+
+// testIssuer serves discovery, keys and a token endpoint. The token endpoint
+// answers with whatever ID token the test last stored.
+type testIssuer struct {
+	*httptest.Server
+	keys    signingKeys
+	mu      sync.Mutex
+	idToken string
+}
+
+func newTestIssuer(t *testing.T) *testIssuer {
+	t.Helper()
+	idp := &testIssuer{keys: newSigningKeys(t)}
+	idp.Server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u := "https://" + r.Host
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/keys":
+			json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
+				{Key: &idp.keys.rsa.PublicKey, KeyID: "rsa", Use: "sig"},
+				{Key: &idp.keys.ec.PublicKey, KeyID: "ec", Use: "sig"},
+			}})
+		case "/token":
+			idp.mu.Lock()
+			token := idp.idToken
+			idp.mu.Unlock()
+			if user, pass, ok := r.BasicAuth(); r.Method != http.MethodPost || !ok || user != "client" || pass != "secret" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			json.NewEncoder(w).Encode(map[string]string{"access_token": "fixture", "token_type": "Bearer", "id_token": token})
+		default:
+			w.Write([]byte(`{"issuer":"` + u + `","authorization_endpoint":"` + u + `/auth","token_endpoint":"` + u +
+				`/token","jwks_uri":"` + u + `/keys"}`))
+		}
+	}))
+	t.Cleanup(idp.Close)
+	return idp
+}
+
+func (idp *testIssuer) client(t *testing.T, scopes ...string) *Client {
+	t.Helper()
+	c, err := New(t.Context(), idp.config(scopes...), NewMemoryStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func (idp *testIssuer) config(scopes ...string) Config {
+	return Config{Issuer: idp.URL, ClientID: "client", ClientSecret: "secret",
+		RedirectURL: "https://app.example/callback", Transport: idp.Client().Transport, Scopes: scopes}
+}
+
+// payload returns ID token claims that pass every check, plus extra.
+func (idp *testIssuer) payload(t *testing.T, nonce string, extra map[string]any) []byte {
+	t.Helper()
+	now := time.Now()
+	claims := map[string]any{
+		"iss": idp.URL, "aud": "client", "sub": "subject", "nonce": nonce,
+		"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
+	}
+	for name, value := range extra {
+		claims[name] = value
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+// login runs Begin and Complete. issue receives the nonce of the
+// authorization request and returns the ID token the issuer answers with.
+func (idp *testIssuer) login(t *testing.T, c *Client, options AuthorizationOptions, issue func(nonce string) string) (Identity, error) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	if err := c.BeginWithOptions(w, httptest.NewRequest("POST", "https://app.example/login", nil), options); err != nil {
+		t.Fatal(err)
+	}
+	loc, err := w.Result().Location()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookies := w.Result().Cookies()
+	if len(cookies) != 1 || loc.Query().Get("nonce") == "" || loc.Query().Get("state") == "" {
+		t.Fatal("authorization request is incomplete")
+	}
+	token := issue(loc.Query().Get("nonce"))
+	idp.mu.Lock()
+	idp.idToken = token
+	idp.mu.Unlock()
+	r := httptest.NewRequest("GET", "https://app.example/callback?code=sample&state="+url.QueryEscape(loc.Query().Get("state")), nil)
+	r.AddCookie(cookies[0])
+	return c.Complete(httptest.NewRecorder(), r)
+}
+
+func requestedScope(t *testing.T, c *Client) string {
+	t.Helper()
+	w := httptest.NewRecorder()
+	if err := c.Begin(w, httptest.NewRequest("POST", "https://app.example/login", nil)); err != nil {
+		t.Fatal(err)
+	}
+	loc, err := w.Result().Location()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loc.Query()["scope"]) != 1 {
+		t.Fatalf("scope parameters: got %q", loc.Query()["scope"])
+	}
+	return loc.Query().Get("scope")
+}
+
+func TestInvalidScopes(t *testing.T) {
+	many := make([]string, 33)
+	for i := range many {
+		many[i] = fmt.Sprintf("scope%d", i)
+	}
+	for _, scopes := range [][]string{
+		{""}, {" "}, {"two words"}, {"tab\t"}, {"line\n"}, {"delete\x7f"}, {"nul\x00"}, {`quo"te`}, {`back\slash`},
+		{"café"}, {"high\xff"}, {"openid"}, {"offline_access"}, {"email", "openid"}, {"email", "offline_access"},
+		{"email", "email"}, {"email", "profile", "email"}, {"email", ""}, {strings.Repeat("a", 256)}, many,
+	} {
+		var transport countingTransport
+		cfg := Config{Issuer: "https://issuer.example", ClientID: "app", ClientSecret: "secret",
+			RedirectURL: "https://app.example/callback", Transport: &transport, Scopes: scopes}
+		if _, err := New(t.Context(), cfg, NewMemoryStore()); err == nil || !strings.Contains(err.Error(), "configuration") {
+			t.Errorf("scopes %q: got %v", scopes, err)
+		}
+		if transport.calls.Load() != 0 {
+			t.Errorf("scopes %q: contacted the provider", scopes)
+		}
+	}
+}
+
+func TestScopes(t *testing.T) {
+	idp := newTestIssuer(t)
+	many := make([]string, 32)
+	for i := range many {
+		many[i] = fmt.Sprintf("scope%d", i)
+	}
+	longest := strings.Repeat("a", 255)
+	for _, tt := range []struct {
+		name   string
+		scopes []string
+		want   string
+	}{
+		{"unset", nil, "openid"},
+		{"empty", []string{}, "openid"},
+		{"one", []string{"email"}, "openid email"},
+		{"in the given order", []string{"profile", "email"}, "openid profile email"},
+		{"scope URL", []string{"email", "profile", "https://example.com/scope"}, "openid email profile https://example.com/scope"},
+		{"other case", []string{"OpenID", "Offline_Access"}, "openid OpenID Offline_Access"},
+		{"every other printable byte", []string{"!#$%&'()*+,-./:;<=>?@[]^_`{|}~"}, "openid !#$%&'()*+,-./:;<=>?@[]^_`{|}~"},
+		{"longest", []string{longest}, "openid " + longest},
+		{"most", many, "openid " + strings.Join(many, " ")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := idp.config(tt.scopes...)
+			c, err := New(t.Context(), cfg, NewMemoryStore())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := requestedScope(t, c); got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+			if len(cfg.Scopes) > 0 {
+				// The caller's slice is not the client's configuration.
+				cfg.Scopes[0] = "changed"
+				if got := requestedScope(t, c); got != tt.want {
+					t.Fatalf("after the caller's change: got %q, want %q", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestIdentityClaims(t *testing.T) {
+	idp := newTestIssuer(t)
+	authTime := time.Now().Add(-30 * time.Second).Unix()
+	for _, scopes := range [][]string{nil, {"email", "profile"}} {
+		c := idp.client(t, scopes...)
+		var nonce string
+		identity, err := idp.login(t, c, AuthorizationOptions{}, func(n string) string {
+			nonce = n
+			return signToken(t, jose.RS256, idp.keys.rsa, "rsa", idp.payload(t, n, map[string]any{
+				"email": "User@Example.com", "email_verified": true, "hd": "example.com",
+				"https://example.com/tenant": "tenant-1", "at_hash": "fixture",
+				"acr": "urn:example:strong", "amr": []string{"pwd", "otp"}, "auth_time": authTime,
+			}))
+		})
+		if err != nil {
+			t.Fatalf("scopes %q: %v", scopes, err)
+		}
+		if identity.ID != (ExternalID{Issuer: idp.URL, Subject: "subject"}) {
+			t.Errorf("scopes %q: got identifier %+v", scopes, identity.ID)
+		}
+		a := identity.Assurance
+		if a.ACR != "urn:example:strong" || len(a.AMR) != 2 || a.AMR[0] != "pwd" || a.AMR[1] != "otp" || !a.AuthTime.Equal(time.Unix(authTime, 0)) {
+			t.Errorf("scopes %q: got assurance %+v", scopes, a)
+		}
+		for name, want := range map[string]string{
+			"email": "User@Example.com", "hd": "example.com", "https://example.com/tenant": "tenant-1",
+			"iss": idp.URL, "sub": "subject", "nonce": nonce, "at_hash": "fixture", "aud": "client",
+		} {
+			if got, ok := identity.Claims.Text(name); !ok || got != want {
+				t.Errorf("scopes %q: Text(%q): got %q, %v", scopes, name, got, ok)
+			}
+		}
+		if verified, ok := identity.Claims.Bool("email_verified"); !ok || !verified {
+			t.Errorf("scopes %q: Bool(email_verified): got %v, %v", scopes, verified, ok)
+		}
+		if _, ok := identity.Claims.Text("Email"); ok || len(identity.Claims) != 14 {
+			t.Errorf("scopes %q: unexpected claims %q", scopes, identity.Claims)
+		}
+	}
+}
+
+func TestIdentityClaimTypes(t *testing.T) {
+	idp := newTestIssuer(t)
+	c := idp.client(t, "email")
+	duplicate := func(first, second string) func(string) string {
+		return func(nonce string) string {
+			now := time.Now().Unix()
+			payload := fmt.Sprintf(`{"iss":%q,"aud":"client","sub":"subject","nonce":%q,"iat":%d,"exp":%d,"email_verified":%s,"email_verified":%s}`,
+				idp.URL, nonce, now, now+3600, first, second)
+			return signToken(t, jose.RS256, idp.keys.rsa, "rsa", []byte(payload))
+		}
+	}
+	with := func(extra map[string]any) func(string) string {
+		return func(nonce string) string {
+			return signToken(t, jose.RS256, idp.keys.rsa, "rsa", idp.payload(t, nonce, extra))
+		}
+	}
+	for _, tt := range []struct {
+		name          string
+		issue         func(string) string
+		present       bool
+		value, isBool bool
+	}{
+		{"string true", with(map[string]any{"email_verified": "true"}), true, false, false},
+		{"number", with(map[string]any{"email_verified": 1}), true, false, false},
+		{"null", with(map[string]any{"email_verified": nil}), true, false, false},
+		{"absent", with(nil), false, false, false},
+		{"false", with(map[string]any{"email_verified": false}), true, false, true},
+		{"false then true", duplicate("false", "true"), true, true, true},
+		{"true then false", duplicate("true", "false"), true, false, true},
+		{"true then string", duplicate("true", `"true"`), true, false, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			identity, err := idp.login(t, c, AuthorizationOptions{}, tt.issue)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, present := identity.Claims["email_verified"]; present != tt.present {
+				t.Errorf("presence: got %v", present)
+			}
+			if value, ok := identity.Claims.Bool("email_verified"); value != tt.value || ok != tt.isBool {
+				t.Errorf("got %v, %v", value, ok)
+			}
+			if identity.ID.Subject != "subject" {
+				t.Errorf("got identifier %+v", identity.ID)
+			}
+		})
+	}
+}
+
+func TestFailedLoginHasNoClaims(t *testing.T) {
+	idp := newTestIssuer(t)
+	c := idp.client(t, "email")
+	five := int64(5)
+	personal := map[string]any{"email": "user@example.com", "email_verified": true, "acr": "urn:example:strong"}
+	with := func(alg jose.SignatureAlgorithm, key any, kid string, extra map[string]any, fixedNonce string) func(string) string {
+		return func(nonce string) string {
+			if fixedNonce != "" {
+				nonce = fixedNonce
+			}
+			claims := map[string]any{}
+			for name, value := range personal {
+				claims[name] = value
+			}
+			for name, value := range extra {
+				claims[name] = value
+			}
+			return signToken(t, alg, key, kid, idp.payload(t, nonce, claims))
+		}
+	}
+	for _, tt := range []struct {
+		name    string
+		options AuthorizationOptions
+		issue   func(string) string
+	}{
+		{"nonce mismatch", AuthorizationOptions{}, with(jose.RS256, idp.keys.rsa, "rsa", nil, randomValue())},
+		{"stale auth_time", AuthorizationOptions{MaxAgeSeconds: &five},
+			with(jose.RS256, idp.keys.rsa, "rsa", map[string]any{"auth_time": time.Now().Add(-time.Hour).Unix()}, "")},
+		{"amr of the wrong type", AuthorizationOptions{}, with(jose.RS256, idp.keys.rsa, "rsa", map[string]any{"amr": "pwd"}, "")},
+		{"algorithm not accepted", AuthorizationOptions{}, with(jose.ES256, idp.keys.ec, "ec", nil, "")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			identity, err := idp.login(t, c, tt.options, tt.issue)
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("got %v, want ErrInvalid", err)
+			}
+			if identity.Claims != nil || identity.ID != (ExternalID{}) || identity.Assurance.ACR != "" ||
+				identity.Assurance.AMR != nil || !identity.Assurance.AuthTime.IsZero() {
+				t.Fatalf("failed login returned %+v", identity)
+			}
+		})
+	}
+	// The same tokens are otherwise acceptable, so each case fails for its own reason.
+	if identity, err := idp.login(t, c, AuthorizationOptions{}, with(jose.RS256, idp.keys.rsa, "rsa", nil, "")); err != nil || identity.Claims == nil {
+		t.Fatalf("control login: got %v", err)
 	}
 }

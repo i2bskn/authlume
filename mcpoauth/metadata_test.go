@@ -562,6 +562,10 @@ func TestMetadataAddressCheck(t *testing.T) {
 		t.Fatalf("loopback: %v, %d fetches", err, docs.count(testDocID))
 	}
 	// The proxy environment is not used.
+	var count dialCount
+	if f.docs.transport(&count).Proxy != nil {
+		t.Fatal("the transport has a proxy")
+	}
 	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:1")
 	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
 	f.fetchFrom(docs)
@@ -663,17 +667,17 @@ func TestMetadataSharedFetch(t *testing.T) {
 		_, err := f.Authorize(t.Context(), cimdParams().Encode())
 		errs <- err
 	}()
-	// The second caller joins the fetch in progress.
+	// The second caller joins the fetch in progress before the first leaves.
 	for {
 		f.docs.mu.Lock()
-		joined := len(f.docs.flights) == 1
+		flight := f.docs.flights[testDocID]
+		joined := flight != nil && flight.waiters == 2
 		f.docs.mu.Unlock()
 		if joined {
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
-	time.Sleep(20 * time.Millisecond)
 	cancel()
 	if err := <-errs; !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled caller: %v", err)
@@ -820,4 +824,51 @@ func TestMetadataTokenFailures(t *testing.T) {
 	// A temporary failure without any entry is a 503.
 	docs.set(testDocID, docResponse{status: http.StatusInternalServerError})
 	post(t, f.Token, cimdExchange(code)).unavailable(t, errFetch)
+}
+
+func TestMetadataDialControl(t *testing.T) {
+	d, err := newMetadataDocs(MetadataDocumentConfig{}, nil, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type dial struct {
+		address string
+		allowed bool
+	}
+	for _, tc := range []struct {
+		name      string
+		dials     []dial
+		permanent bool
+	}{
+		{"no attempt", nil, false},
+		{"every address refused", []dial{{"10.0.0.1:443", false}, {"[fd00::1]:443", false}}, true},
+		{"one refused, one allowed", []dial{{"10.0.0.1:443", false}, {"8.8.8.8:443", true}}, false},
+		{"allowed then refused", []dial{{"[2606:4700::1111]:443", true}, {"127.0.0.1:443", false}}, false},
+		{"unparsable address", []dial{{"app.example.com:443", false}}, true},
+		{"zoned address", []dial{{"[fe80::1%eth0]:443", false}}, true},
+	} {
+		var count dialCount
+		control := d.control(&count)
+		for _, dial := range tc.dials {
+			if err := control("tcp", dial.address, nil); (err == nil) != dial.allowed {
+				t.Errorf("%s: %s: %v", tc.name, dial.address, err)
+			}
+		}
+		if count.allRefused() != tc.permanent {
+			t.Errorf("%s: permanent %v", tc.name, count.allRefused())
+		}
+	}
+}
+
+func TestMetadataCanceledCaller(t *testing.T) {
+	f, docs := cimdFixture(t)
+	docs.set(testDocID, docResponse{body: metadataDoc(testDocID, nil)})
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	r := post(t, f.Revocation, url.Values{"client_id": {testDocID}, "token": {"x"}}, func(r *http.Request) {
+		*r = *r.WithContext(ctx)
+	})
+	if r.status != http.StatusServiceUnavailable || !errors.Is(r.err, context.Canceled) || docs.count(testDocID) != 0 {
+		t.Fatalf("canceled caller: %d %v, %d fetches", r.status, r.err, docs.count(testDocID))
+	}
 }

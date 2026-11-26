@@ -200,7 +200,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) (Registration,
 				err: fmt.Errorf("%w: missing initial access token", ErrInvalid)}
 		}
 		scheme, token, _ := strings.Cut(headers[0], " ")
-		if len(headers) > 1 || !strings.EqualFold(scheme, "Bearer") || token == "" {
+		if len(headers) > 1 || !strings.EqualFold(scheme, "Bearer") || token == "" || token != strings.TrimSpace(token) {
 			return Registration{}, &failure{status: http.StatusBadRequest, code: "invalid_request",
 				challenge: `Bearer error="invalid_request"`, err: fmt.Errorf("%w: invalid_request", ErrInvalid)}
 		}
@@ -283,7 +283,9 @@ func (s *MemoryClientStore) CreateClient(ctx context.Context, reg Registration) 
 		return ErrCollision
 	}
 	if len(s.regs) >= memoryClientCapacity {
-		now := time.Now()
+		// The server sets CreatedAt from its own clock, which ExpiresAt
+		// also follows.
+		now := reg.CreatedAt
 		for id, r := range s.regs {
 			if r.expired(now) {
 				delete(s.regs, id)

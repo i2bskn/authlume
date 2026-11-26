@@ -135,9 +135,10 @@ type metadataEntry struct {
 }
 
 type metadataFlight struct {
-	done  chan struct{}
-	entry metadataEntry
-	err   error
+	done    chan struct{}
+	waiters int // callers that started or joined it, for tests
+	entry   metadataEntry
+	err     error
 }
 
 func newMetadataDocs(cfg MetadataDocumentConfig, own []string, now func() time.Time) (*metadataDocs, error) {
@@ -402,6 +403,11 @@ func (d *metadataDocs) fetch(ctx context.Context, id, host string) (metadataEntr
 	d.mu.Lock()
 	flight, joined := d.flights[id]
 	if !joined {
+		// A caller that has already left starts no fetch.
+		if err := ctx.Err(); err != nil {
+			d.mu.Unlock()
+			return metadataEntry{}, err
+		}
 		if d.active >= maxFetches || d.perHost[host] >= maxFetchesPerHost {
 			d.mu.Unlock()
 			return metadataEntry{}, fmt.Errorf("%w: too many concurrent fetches", errFetch)
@@ -412,6 +418,7 @@ func (d *metadataDocs) fetch(ctx context.Context, id, host string) (metadataEntr
 		d.flights[id] = flight
 		go d.run(context.WithoutCancel(ctx), id, host, flight)
 	}
+	flight.waiters++
 	d.mu.Unlock()
 	select {
 	case <-flight.done:
@@ -469,36 +476,43 @@ func (d *metadataDocs) insert(id string, entry *metadataEntry, now time.Time) {
 	d.cache[id] = entry
 }
 
-// get performs one fetch and validates the document. It returns a
-// *MetadataError for a failure that retrying does not fix and an error
-// wrapping errFetch otherwise.
-func (d *metadataDocs) get(ctx context.Context, id string) (Client, time.Duration, error) {
-	permanent := func(reason string) (Client, time.Duration, error) {
-		return Client{}, 0, &MetadataError{ClientID: id, Reason: reason}
-	}
-	temporary := func(reason string, err error) (Client, time.Duration, error) {
-		if err != nil {
-			return Client{}, 0, fmt.Errorf("%w: %s: %w", errFetch, reason, err)
-		}
-		return Client{}, 0, fmt.Errorf("%w: %s", errFetch, reason)
-	}
-	// The counters belong to this fetch: every dialed address is counted,
-	// and the fetch failed permanently only when all of them were refused.
-	var attempts, refused atomic.Int64
+// dialCount counts the addresses one fetch dialed and how many of them the
+// address check refused. It belongs to one fetch, so concurrent fetches never
+// share it.
+type dialCount struct{ attempts, refused atomic.Int64 }
+
+// allRefused reports whether the fetch dialed at least one address and the
+// check refused every one. Then the failure is permanent; a fetch where some
+// address was allowed and then failed is temporary.
+func (c *dialCount) allRefused() bool {
+	n := c.attempts.Load()
+	return n > 0 && c.refused.Load() == n
+}
+
+// control checks each address actually dialed, after name resolution, so
+// DNS rebinding and multiple records are both covered.
+func (d *metadataDocs) control(count *dialCount) func(string, string, syscall.RawConn) error {
 	permit := publicAddr
 	if d.test != nil && d.test.permit != nil {
 		permit = d.test.permit
 	}
-	dialer := &net.Dialer{Timeout: d.timeout, Control: func(_, address string, _ syscall.RawConn) error {
-		attempts.Add(1)
+	return func(_, address string, _ syscall.RawConn) error {
+		count.attempts.Add(1)
 		host, _, err := net.SplitHostPort(address)
 		addr, parseErr := netip.ParseAddr(host)
 		if err != nil || parseErr != nil || !permit(addr) {
-			refused.Add(1)
+			count.refused.Add(1)
 			return errBlocked
 		}
 		return nil
-	}}
+	}
+}
+
+// transport builds the dedicated transport of one fetch. It never uses a
+// proxy, keeps no connection and does not decompress, so MaxSize counts the
+// bytes transferred.
+func (d *metadataDocs) transport(count *dialCount) *http.Transport {
+	dialer := &net.Dialer{Timeout: d.timeout, Control: d.control(count)}
 	transport := &http.Transport{
 		Proxy: nil,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -517,6 +531,24 @@ func (d *metadataDocs) get(ctx context.Context, id string) (Client, time.Duratio
 	if d.test != nil && d.test.tls != nil {
 		transport.TLSClientConfig = d.test.tls.Clone()
 	}
+	return transport
+}
+
+// get performs one fetch and validates the document. It returns a
+// *MetadataError for a failure that retrying does not fix and an error
+// wrapping errFetch otherwise.
+func (d *metadataDocs) get(ctx context.Context, id string) (Client, time.Duration, error) {
+	permanent := func(reason string) (Client, time.Duration, error) {
+		return Client{}, 0, &MetadataError{ClientID: id, Reason: reason}
+	}
+	temporary := func(reason string, err error) (Client, time.Duration, error) {
+		if err != nil {
+			return Client{}, 0, fmt.Errorf("%w: %s: %w", errFetch, reason, err)
+		}
+		return Client{}, 0, fmt.Errorf("%w: %s", errFetch, reason)
+	}
+	var count dialCount
+	transport := d.transport(&count)
 	defer transport.CloseIdleConnections()
 	client := &http.Client{
 		Transport: transport, Timeout: d.timeout,
@@ -530,7 +562,7 @@ func (d *metadataDocs) get(ctx context.Context, id string) (Client, time.Duratio
 	req.Header.Set("User-Agent", metadataUserAgent)
 	resp, err := client.Do(req)
 	if err != nil {
-		if n := attempts.Load(); n > 0 && refused.Load() == n {
+		if count.allRefused() {
 			return permanent("blocked address")
 		}
 		return temporary("request failed", err)
@@ -677,8 +709,8 @@ func clientName(m map[string]json.RawMessage) (string, string) {
 		return "", "invalid client_name"
 	}
 	for _, r := range name {
-		if unicode.Is(unicode.Cc, r) || r == '‎' || r == '‏' ||
-			(r >= '‪' && r <= '‮') || (r >= '⁦' && r <= '⁩') {
+		if unicode.Is(unicode.Cc, r) || r == '\u200e' || r == '\u200f' ||
+			(r >= '\u202a' && r <= '\u202e') || (r >= '\u2066' && r <= '\u2069') {
 			return "", "invalid client_name"
 		}
 	}

@@ -296,7 +296,8 @@ func TestRegisterInitialAccessToken(t *testing.T) {
 	if r.header.Get("WWW-Authenticate") != "Bearer" {
 		t.Fatalf("missing token: %v", r.header)
 	}
-	for _, values := range [][]string{{"Basic Z29vZA=="}, {"Bearer "}, {"Bearer"}, {"Bearer good", "Bearer good"}} {
+	for _, values := range [][]string{{"Basic Z29vZA=="}, {"Bearer "}, {"Bearer"}, {"Bearer good", "Bearer good"},
+		{"Bearer  good"}, {"Bearer good "}} {
 		r := register(t, f.Server, registrationBody(nil), header(values...))
 		r.failed(t, http.StatusBadRequest, "invalid_request")
 		if r.header.Get("WWW-Authenticate") != `Bearer error="invalid_request"` {
@@ -464,7 +465,7 @@ func (s *oddClientStore) Client(ctx context.Context, id string, now time.Time) (
 func TestMemoryClientStoreCapacity(t *testing.T) {
 	ctx := t.Context()
 	s := NewMemoryClientStore()
-	far := time.Now().Add(time.Hour)
+	far := testStart.Add(100 * time.Hour)
 	for i := range memoryClientCapacity {
 		reg := Registration{ID: fmt.Sprintf("r%04d", i), RedirectURIs: []string{"https://a.example/cb"},
 			CreatedAt: testStart.Add(time.Duration(i) * time.Second)}
@@ -472,7 +473,7 @@ func TestMemoryClientStoreCapacity(t *testing.T) {
 			reg.ExpiresAt = far
 		}
 		if i == 10 {
-			reg.ExpiresAt = time.Now().Add(-time.Second)
+			reg.ExpiresAt = testStart.Add(time.Hour)
 		}
 		if err := s.CreateClient(ctx, reg); err != nil {
 			t.Fatal(err)
@@ -505,7 +506,7 @@ func TestMemoryClientStoreCapacity(t *testing.T) {
 		t.Fatalf("%d registrations: %v", len(regs), err)
 	}
 	for _, reg := range regs {
-		if err := s.Activate(ctx, reg.ID, time.Now()); err != nil {
+		if err := s.Activate(ctx, reg.ID, testStart); err != nil {
 			t.Fatal(err)
 		}
 	}

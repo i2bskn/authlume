@@ -1,6 +1,7 @@
 package oidc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -287,6 +288,9 @@ func (c *Client) BeginWithOptions(w http.ResponseWriter, r *http.Request, option
 		age := *options.MaxAgeSeconds
 		tx.MaxAgeSeconds = &age
 	}
+	if len(options.AppData) != 0 {
+		tx.AppData = bytes.Clone(options.AppData)
+	}
 	if err := c.store.Create(r.Context(), c.key(state, browser), tx); err != nil {
 		return err
 	}
@@ -320,40 +324,56 @@ func (c *Client) browserValue(r *http.Request) (string, bool) {
 // Mount only at the registered GET callback. A successful Identity must pass
 // application linking and authentication policy before session issuance.
 func (c *Client) Complete(w http.ResponseWriter, r *http.Request) (Identity, error) {
+	identity, _, err := c.CompleteWithAppData(w, r)
+	return identity, err
+}
+
+// CompleteWithAppData is Complete that also returns the AppData given to
+// BeginWithOptions. The data is nil unless the login succeeded. It is only as
+// trustworthy as the code that stored it, so validate it before use.
+func (c *Client) CompleteWithAppData(w http.ResponseWriter, r *http.Request) (Identity, []byte, error) {
+	identity, tx, err := c.complete(w, r)
+	if err != nil {
+		return Identity{}, nil, err
+	}
+	return identity, tx.AppData, nil
+}
+
+func (c *Client) complete(w http.ResponseWriter, r *http.Request) (Identity, Transaction, error) {
 	privateResponse(w)
 	q, err := url.ParseQuery(r.URL.RawQuery)
 	browser, ok := c.browserValue(r)
 	if r.Method != http.MethodGet || err != nil || !ok || len(q["state"]) != 1 || !validValue(q.Get("state")) {
-		return Identity{}, ErrInvalid
+		return Identity{}, Transaction{}, ErrInvalid
 	}
 	// An unmatched or unavailable store may still hold the current browser's
 	// pending login. Only clear the cookie after a confirmed consumption.
 	tx, err := c.store.Take(r.Context(), c.key(q.Get("state"), browser), time.Now())
 	if err != nil {
-		return Identity{}, err
+		return Identity{}, Transaction{}, err
 	}
 	http.SetCookie(w, c.cookie("", -1))
 	if !time.Now().Before(tx.ExpiresAt) || tx.Nonce == "" || tx.Verifier == "" || q.Has("error") ||
 		len(q["code"]) != 1 || q.Get("code") == "" ||
 		((c.requireResponseIssuer || q.Has("iss")) && (len(q["iss"]) != 1 || q.Get("iss") != c.issuer)) {
-		return Identity{}, ErrInvalid
+		return Identity{}, Transaction{}, ErrInvalid
 	}
 	ctx := provider.ClientContext(r.Context(), c.http)
 	t, err := c.oauth.Exchange(ctx, q.Get("code"), oauth2.VerifierOption(tx.Verifier))
 	if err != nil {
-		return Identity{}, exchangeError(ctx, err)
+		return Identity{}, Transaction{}, exchangeError(ctx, err)
 	}
 	raw, _ := t.Extra("id_token").(string)
 	id, err := c.verifyToken(ctx, raw)
 	if err != nil {
-		return Identity{}, err
+		return Identity{}, Transaction{}, err
 	}
 	now := time.Now()
 	identity, err := c.identity(id, tx.Nonce, now)
 	if err != nil || !tx.acceptsAuthTime(identity.Assurance.AuthTime, now) {
-		return Identity{}, ErrInvalid
+		return Identity{}, Transaction{}, ErrInvalid
 	}
-	return identity, nil
+	return identity, tx, nil
 }
 
 // Go struct unmarshalling folds case. Read the exact JWT claim names from the

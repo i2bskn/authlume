@@ -4,6 +4,7 @@
 package oidc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
@@ -26,6 +27,9 @@ type Transaction struct {
 	StartedAt time.Time
 	// MaxAgeSeconds is the requested freshness constraint. Persist nil distinctly from zero.
 	MaxAgeSeconds *int64
+	// AppData is the application's opaque value from AuthorizationOptions.
+	// Persist it as is. Nil and empty are equivalent.
+	AppData []byte
 }
 
 // Store operations on a key must be atomic, including across processes. Arrange
@@ -67,6 +71,7 @@ func (s *MemoryStore) Create(_ context.Context, key Key, tx Transaction) error {
 	if _, ok := s.pending[key]; ok {
 		return errors.New("oidc: transaction key collision")
 	}
+	tx.AppData = bytes.Clone(tx.AppData)
 	s.pending[key] = tx
 	return nil
 }
@@ -79,5 +84,6 @@ func (s *MemoryStore) Take(_ context.Context, key Key, now time.Time) (Transacti
 	if !ok || !now.Before(tx.ExpiresAt) {
 		return Transaction{}, ErrInvalid
 	}
+	tx.AppData = bytes.Clone(tx.AppData)
 	return tx, nil
 }

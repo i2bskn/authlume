@@ -126,6 +126,27 @@ err := client.BeginWithOptions(w, r, oidc.AuthorizationOptions{
 - An ACR preference or a login prompt is a request, not proof. Check the actual signed ACR afterwards.
 - A shared store must round-trip `StartedAt` and `MaxAgeSeconds`, including the difference between absent and zero. Upgrade every callback handler and store before enabling freshness requests.
 
+## Return the browser where it started
+
+`AuthorizationOptions.AppData` carries an opaque value, such as the page to show after sign-in, from the start of a login to its callback. It is kept in the server-side transaction, so it never reaches the browser or the provider. `CompleteWithAppData` returns it, only after a successful login.
+
+```go
+// At the start route, after validating the requested path.
+err := client.BeginWithOptions(w, r, oidc.AuthorizationOptions{AppData: []byte(returnTo)})
+
+// At the callback.
+identity, data, err := client.CompleteWithAppData(w, r)
+if err == nil {
+	returnTo := string(data)
+	// Validate returnTo again before redirecting to it.
+}
+```
+
+- `AppData` is limited to `oidc.MaxAppData` (16 KiB). A larger value makes `BeginWithOptions` fail before anything is stored.
+- The value is copied when the login starts. A failed login returns nil.
+- The value is only as trustworthy as the code that stored it. Validate it again before use, for example when the rules for allowed paths change between start and callback.
+- A shared store must round-trip `AppData`. Upgrade every callback handler and store before starting logins with it.
+
 ## Signature algorithms
 
 By default only RS256 is accepted. List the algorithms to accept in `Config.SigningAlgs`.

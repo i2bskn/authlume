@@ -863,6 +863,46 @@ func TestIdentityClaimTypes(t *testing.T) {
 	}
 }
 
+// The package checks neither hd nor email_verified: it returns them as the
+// issuer signed them, and the application decides whom to admit.
+func TestHostedDomainClaim(t *testing.T) {
+	idp := newTestIssuer(t)
+	c := idp.client(t, "email")
+	for _, tt := range []struct {
+		name     string
+		extra    map[string]any
+		hd       string
+		hasHD    bool
+		verified bool
+	}{
+		{"absent", map[string]any{"email": "user@gmail.com", "email_verified": true}, "", false, true},
+		{"present", map[string]any{"email": "user@example.com", "email_verified": true, "hd": "example.com"}, "example.com", true, true},
+		{"unlike the email domain", map[string]any{"email": "user@example.com", "email_verified": true, "hd": "Other.Example"}, "Other.Example", true, true},
+		{"with an unverified email", map[string]any{"email": "user@example.com", "email_verified": false, "hd": "example.com"}, "example.com", true, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			identity, err := idp.login(t, c, AuthorizationOptions{}, func(nonce string) string {
+				return signToken(t, jose.RS256, idp.keys.rsa, "rsa", idp.payload(t, nonce, tt.extra))
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, present := identity.Claims["hd"]; present != tt.hasHD {
+				t.Errorf("hd presence: got %v", present)
+			}
+			if hd, ok := identity.Claims.Text("hd"); hd != tt.hd || ok != tt.hasHD {
+				t.Errorf("Text(hd): got %q, %v", hd, ok)
+			}
+			if verified, ok := identity.Claims.Bool("email_verified"); verified != tt.verified || !ok {
+				t.Errorf("Bool(email_verified): got %v, %v", verified, ok)
+			}
+			if email, ok := identity.Claims.Text("email"); !ok || email != tt.extra["email"] {
+				t.Errorf("Text(email): got %q, %v", email, ok)
+			}
+		})
+	}
+}
+
 func TestFailedLoginHasNoClaims(t *testing.T) {
 	idp := newTestIssuer(t)
 	c := idp.client(t, "email")
@@ -883,12 +923,60 @@ func TestFailedLoginHasNoClaims(t *testing.T) {
 			return signToken(t, alg, key, kid, idp.payload(t, nonce, claims))
 		}
 	}
+	// without signs a token that lacks the named claim.
+	without := func(name string) func(string) string {
+		return func(nonce string) string {
+			var claims map[string]any
+			if err := json.Unmarshal(idp.payload(t, nonce, personal), &claims); err != nil {
+				t.Fatal(err)
+			}
+			delete(claims, name)
+			payload, err := json.Marshal(claims)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return signToken(t, jose.RS256, idp.keys.rsa, "rsa", payload)
+		}
+	}
+	// altered signs a valid token, then swaps in a payload that differs only
+	// in one personal claim and keeps the original signature.
+	altered := func(nonce string) string {
+		signed := strings.Split(with(jose.RS256, idp.keys.rsa, "rsa", nil, "")(nonce), ".")
+		raw, err := base64.RawURLEncoding.DecodeString(signed[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var claims map[string]any
+		if err := json.Unmarshal(raw, &claims); err != nil {
+			t.Fatal(err)
+		}
+		claims["email"] = "attacker@example.com"
+		changed, err := json.Marshal(claims)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signed[1] = base64.RawURLEncoding.EncodeToString(changed)
+		return strings.Join(signed, ".")
+	}
+	unpublished, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
 	for _, tt := range []struct {
 		name    string
 		options AuthorizationOptions
 		issue   func(string) string
 	}{
+		{"signed by an unpublished key", AuthorizationOptions{}, with(jose.RS256, unpublished, "rsa", nil, "")},
+		{"payload altered after signing", AuthorizationOptions{}, altered},
 		{"nonce mismatch", AuthorizationOptions{}, with(jose.RS256, idp.keys.rsa, "rsa", nil, randomValue())},
+		{"nonce missing", AuthorizationOptions{}, without("nonce")},
+		{"nonce null", AuthorizationOptions{}, with(jose.RS256, idp.keys.rsa, "rsa", map[string]any{"nonce": nil}, "")},
+		{"another issuer", AuthorizationOptions{}, with(jose.RS256, idp.keys.rsa, "rsa", map[string]any{"iss": "https://other.example"}, "")},
+		{"another audience", AuthorizationOptions{}, with(jose.RS256, idp.keys.rsa, "rsa", map[string]any{"aud": "other-client"}, "")},
+		{"expired", AuthorizationOptions{}, with(jose.RS256, idp.keys.rsa, "rsa",
+			map[string]any{"iat": now.Add(-2 * time.Hour).Unix(), "exp": now.Add(-time.Hour).Unix()}, "")},
 		{"stale auth_time", AuthorizationOptions{MaxAgeSeconds: &five},
 			with(jose.RS256, idp.keys.rsa, "rsa", map[string]any{"auth_time": time.Now().Add(-time.Hour).Unix()}, "")},
 		{"amr of the wrong type", AuthorizationOptions{}, with(jose.RS256, idp.keys.rsa, "rsa", map[string]any{"amr": "pwd"}, "")},
@@ -908,5 +996,58 @@ func TestFailedLoginHasNoClaims(t *testing.T) {
 	// The same tokens are otherwise acceptable, so each case fails for its own reason.
 	if identity, err := idp.login(t, c, AuthorizationOptions{}, with(jose.RS256, idp.keys.rsa, "rsa", nil, "")); err != nil || identity.Claims == nil {
 		t.Fatalf("control login: got %v", err)
+	}
+	if identity, err := idp.login(t, c, AuthorizationOptions{}, without("email")); err != nil || identity.Claims == nil {
+		t.Fatalf("control login without an optional claim: got %v", err)
+	}
+}
+
+// go-oidc already rejects a token from another issuer, for another audience
+// or past its expiry. This test turns those upstream checks off, so that it
+// covers the package's own checks of the same claims.
+func TestIdentityChecksClaimsItself(t *testing.T) {
+	const issuer, clientID, nonce = "https://id.example", "client", "nonce"
+	k := newSigningKeys(t)
+	c := &Client{issuer: issuer, oauth: oauth2.Config{ClientID: clientID}}
+	verifier := provider.NewVerifier(issuer, &provider.StaticKeySet{PublicKeys: []crypto.PublicKey{&k.rsa.PublicKey}},
+		&provider.Config{SkipIssuerCheck: true, SkipClientIDCheck: true, SkipExpiryCheck: true})
+	now := time.Now()
+	for _, tt := range []struct {
+		name  string
+		extra map[string]any
+		want  bool
+	}{
+		{"control", nil, true},
+		{"another issuer", map[string]any{"iss": "https://other.example"}, false},
+		{"another audience", map[string]any{"aud": "other-client"}, false},
+		{"two audiences", map[string]any{"aud": []string{clientID, "other-client"}}, false},
+		{"another authorized party", map[string]any{"azp": "other-client"}, false},
+		{"expired", map[string]any{"iat": now.Add(-2 * time.Hour).Unix(), "exp": now.Add(-time.Hour).Unix()}, false},
+		{"not yet valid", map[string]any{"nbf": now.Add(time.Hour).Unix()}, false},
+		{"issued in the future", map[string]any{"iat": now.Add(10 * time.Minute).Unix()}, false},
+		{"empty subject", map[string]any{"sub": ""}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			claims := map[string]any{"iss": issuer, "aud": clientID, "sub": "subject", "nonce": nonce,
+				"iat": now.Unix(), "exp": now.Add(time.Hour).Unix()}
+			for name, value := range tt.extra {
+				claims[name] = value
+			}
+			payload, err := json.Marshal(claims)
+			if err != nil {
+				t.Fatal(err)
+			}
+			token, err := verifier.Verify(t.Context(), signToken(t, jose.RS256, k.rsa, "", payload))
+			if err != nil {
+				t.Fatalf("upstream verification: %v", err)
+			}
+			identity, err := c.identity(token, nonce, now)
+			if tt.want && (err != nil || identity.ID.Subject != "subject") {
+				t.Fatalf("got %+v, %v", identity, err)
+			}
+			if !tt.want && (!errors.Is(err, ErrInvalid) || identity.Claims != nil) {
+				t.Fatalf("got %+v, %v, want ErrInvalid", identity, err)
+			}
+		})
 	}
 }

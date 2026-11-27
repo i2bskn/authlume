@@ -4,7 +4,7 @@ This loopback example signs in one pre-enrolled user. With `-require-mfa`, submi
 
 ## Run the example
 
-Use Go 1.25 or later, Bash, OpenSSL, and a local authenticator app. Generate a localhost certificate and a fresh demo seed.
+Use Go 1.26 or later, Bash, OpenSSL, and a local authenticator app. Generate a localhost certificate and a fresh demo seed.
 
 ```bash
 certdir=$(mktemp -d)

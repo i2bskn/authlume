@@ -4,7 +4,7 @@ This loopback example is an OAuth 2.1 authorization server and a protected MCP e
 
 ## Run
 
-Use Go 1.25 or later, Bash and OpenSSL. Generate a certificate for the loopback address, set a demo password and register the client's ID and redirect URI.
+Use Go 1.26 or later, Bash and OpenSSL. Generate a certificate for the loopback address, set a demo password and register the client's ID and redirect URI.
 
 ```bash
 certdir=$(mktemp -d)

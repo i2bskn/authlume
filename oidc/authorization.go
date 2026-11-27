@@ -20,10 +20,21 @@ type AuthorizationOptions struct {
 	ACRValues []string
 	// Prompt can be empty, none, login, consent or select_account.
 	Prompt string
+	// AppData is opaque application state, such as a validated return path,
+	// stored with the server-side transaction and returned only after a
+	// successful completion. It never reaches the browser or the provider.
+	// It is limited to MaxAppData bytes. Validate it again after completion.
+	AppData []byte
 }
+
+// MaxAppData is the largest AuthorizationOptions.AppData accepted.
+const MaxAppData = 16 << 10
 
 func (o AuthorizationOptions) parameters() ([]oauth2.AuthCodeOption, error) {
 	var params []oauth2.AuthCodeOption
+	if len(o.AppData) > MaxAppData {
+		return nil, errors.New("oidc: app data too large")
+	}
 	if o.MaxAgeSeconds != nil {
 		if *o.MaxAgeSeconds < 0 {
 			return nil, errors.New("oidc: max_age must be nonnegative")

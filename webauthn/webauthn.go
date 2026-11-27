@@ -100,6 +100,10 @@ func New(origin, displayName string, credentials Store, ceremonies CeremonyStore
 		},
 		AttestationPreference: protocol.PreferNoAttestation,
 		Timeouts:              wa.TimeoutsConfig{Registration: timeout, Login: timeout},
+		// No extension is requested and no output is used. Browsers and
+		// authenticators can return outputs unprompted, so ignore them as
+		// go-webauthn did before v0.18 instead of failing the ceremony.
+		ExtensionsUnsolicitedOutputPolicy: protocol.UnsolicitedOutputPolicyIgnore,
 	})
 	if err != nil {
 		return nil, err
@@ -237,7 +241,7 @@ func (v *Verifier) take(ctx context.Context, handle, purpose string) (ceremonyRe
 	}
 	if rec.Purpose != purpose || !bound ||
 		s.RelyingPartyID != v.rpID || s.Challenge == "" || s.Expires.IsZero() || !time.Now().Before(s.Expires) ||
-		s.Mediation != "" || s.UserVerification != uv || len(s.Extensions) != 0 {
+		s.Mediation != "" || s.UserVerification != uv || !s.Extensions.IsZero() {
 		return ceremonyRecord{}, ErrInvalid
 	}
 	return rec, nil

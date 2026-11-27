@@ -433,7 +433,7 @@ func TestCeremonyRecord(t *testing.T) {
 		"no expiry":       {mutate: edit(t, func(r *ceremonyRecord) { r.Session.Expires = time.Time{} }), want: ErrInvalid},
 		"mediation":       {mutate: edit(t, func(r *ceremonyRecord) { r.Session.Mediation = protocol.MediationOptional }), want: ErrInvalid},
 		"verification":    {mutate: edit(t, func(r *ceremonyRecord) { r.Session.UserVerification = protocol.VerificationDiscouraged }), want: ErrInvalid},
-		"extensions":      {mutate: edit(t, func(r *ceremonyRecord) { r.Session.Extensions = protocol.AuthenticationExtensions{"x": true} }), want: ErrInvalid},
+		"extensions":      {mutate: edit(t, func(r *ceremonyRecord) { r.Session.Extensions.Extra = map[string]any{"x": true} }), want: ErrInvalid},
 	} {
 		t.Run(name, func(t *testing.T) {
 			ceremonies.mutate, ceremonies.takeErr = tc.mutate, tc.takeErr
@@ -1029,7 +1029,7 @@ func TestPasskeyCeremonyRecord(t *testing.T) {
 		"RP ID":               {mutate: edit(t, func(r *ceremonyRecord) { r.Session.RelyingPartyID = "other.example" }), want: ErrInvalid},
 		"expired":             {mutate: edit(t, func(r *ceremonyRecord) { r.Session.Expires = time.Now().Add(-time.Second) }), want: ErrInvalid},
 		"mediation":           {mutate: edit(t, func(r *ceremonyRecord) { r.Session.Mediation = protocol.MediationOptional }), want: ErrInvalid},
-		"extensions":          {mutate: edit(t, func(r *ceremonyRecord) { r.Session.Extensions = protocol.AuthenticationExtensions{"x": true} }), want: ErrInvalid},
+		"extensions":          {mutate: edit(t, func(r *ceremonyRecord) { r.Session.Extensions.Extra = map[string]any{"x": true} }), want: ErrInvalid},
 		"verification reg":    {mutate: edit(t, func(r *ceremonyRecord) { r.Session.UserVerification = protocol.VerificationPreferred }), registration: true, want: ErrInvalid},
 		"purpose reg":         {mutate: edit(t, func(r *ceremonyRecord) { r.Purpose = registration }), registration: true, want: ErrInvalid},
 		"empty subject reg":   {mutate: edit(t, func(r *ceremonyRecord) { r.Subject, r.Session.UserID = "", nil }), registration: true, want: ErrInvalid},
@@ -1181,5 +1181,35 @@ func TestPasskeySharedStoresAndRevoke(t *testing.T) {
 	}
 	if subject, err := v.FinishPasskeyLogin(t.Context(), handle, k.Sign(t, passkeyAssertion(challenge, "alice", verified, 1))); err != nil || subject != "alice" {
 		t.Fatal(subject, err)
+	}
+}
+
+// withExtensionOutputs adds client extension outputs that were not requested,
+// as some browsers and authenticators return them unprompted.
+func withExtensionOutputs(t *testing.T, response []byte) []byte {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(response, &m); err != nil {
+		t.Fatal(err)
+	}
+	m["clientExtensionResults"] = map[string]any{"credProps": map[string]any{"rk": true}}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestUnrequestedExtensionOutputsAreIgnored(t *testing.T) {
+	v, _, _, k := setup(t)
+	challenge, handle := beginRegistration(t, v, "alice")
+	response := withExtensionOutputs(t, k.Registration(t, challenge, testOrigin, testRPID, present))
+	if subject, err := v.FinishRegistration(t.Context(), handle, response); err != nil || subject != "alice" {
+		t.Fatalf("registration with unrequested outputs: %q, %v", subject, err)
+	}
+	challenge, handle = start(t, v, "alice")
+	response = withExtensionOutputs(t, k.Sign(t, validAssertion(challenge, "alice", 1)))
+	if subject, err := v.FinishVerification(t.Context(), handle, response); err != nil || subject != "alice" {
+		t.Fatalf("verification with unrequested outputs: %q, %v", subject, err)
 	}
 }

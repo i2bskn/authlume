@@ -10,7 +10,7 @@ Open an issue first for anything larger than a small fix. Authentication code is
 
 ## Build and test
 
-You need Go 1.25 or later. The module has no code generation step and no service to start.
+You need Go 1.26 or later. The module has no code generation step and no service to start.
 
 ```sh
 go build ./...

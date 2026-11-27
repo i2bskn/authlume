@@ -4,7 +4,7 @@ This standard `net/http` example requires a password and a registered platform p
 
 ## Run locally
 
-Use Go 1.25 or later, OpenSSL, a WebAuthn authenticator and a browser supporting the WebAuthn JSON conversion methods. Generate a localhost certificate, a demo password and a separate random first-enrollment code. Use the code only for this run.
+Use Go 1.26 or later, OpenSSL, a WebAuthn authenticator and a browser supporting the WebAuthn JSON conversion methods. Generate a localhost certificate, a demo password and a separate random first-enrollment code. Use the code only for this run.
 
 ```bash
 certdir=$(mktemp -d)

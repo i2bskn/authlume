@@ -17,7 +17,7 @@ From v1.0.0 on, the module will follow semantic versioning.
 
 ## Requirements
 
-- Go 1.25 or later
+- Go 1.26 or later
 - The `totp` package needs HMAC-SHA-1 and does not work in Go's FIPS 140-only mode. The `password` package offers PBKDF2-HMAC-SHA-256 for applications that need a FIPS-approved algorithm.
 
 ## What the tests cover

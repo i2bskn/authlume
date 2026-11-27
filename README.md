@@ -21,7 +21,7 @@ Authlume has no tagged release yet. Until v1.0.0 the API can change in incompati
 
 ## Install
 
-Authlume needs Go 1.25 or later.
+Authlume needs Go 1.26 or later.
 
 ```sh
 go get github.com/i2bskn/authlume

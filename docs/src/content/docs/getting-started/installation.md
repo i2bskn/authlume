@@ -3,7 +3,7 @@ title: Installation
 description: Add the module and import only the packages the application uses.
 ---
 
-Authlume is one module, `github.com/i2bskn/authlume`, for Go 1.25 and later. Its packages are independently importable, and only the application composes them.
+Authlume is one module, `github.com/i2bskn/authlume`, for Go 1.26 and later. Its packages are independently importable, and only the application composes them.
 
 ```sh
 go get github.com/i2bskn/authlume
